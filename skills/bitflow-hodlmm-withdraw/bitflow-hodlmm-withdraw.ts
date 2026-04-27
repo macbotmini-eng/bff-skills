@@ -1,5 +1,9 @@
 #!/usr/bin/env bun
 
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { Command } from "commander";
 import {
   AnchorMode,
@@ -220,6 +224,55 @@ interface SharedOptions {
   withdrawBps?: string;
   slippageBps?: string;
   minGasReserveUstx?: string;
+}
+
+interface EncryptedData {
+  ciphertext: string;
+  iv: string;
+  authTag: string;
+  salt: string;
+  scryptParams: {
+    N: number;
+    r: number;
+    p: number;
+    keyLen: number;
+  };
+}
+
+interface WalletMetadata {
+  id: string;
+  name?: string;
+  address: string;
+  network: string;
+}
+
+interface WalletIndex {
+  wallets: WalletMetadata[];
+}
+
+interface AppConfig {
+  activeWalletId?: string | null;
+}
+
+interface KeystoreFile {
+  encrypted: EncryptedData;
+}
+
+interface SessionFile {
+  version: number;
+  walletId: string;
+  encrypted: {
+    ciphertext: string;
+    iv: string;
+    authTag: string;
+  };
+  expiresAt: string | null;
+}
+
+interface SerializedAccount {
+  address: string;
+  privateKey: string;
+  network: string;
 }
 
 function stringify(value: unknown): string {
@@ -826,66 +879,154 @@ function binData(bin: PositionCandidate) {
   };
 }
 
-async function resolveSigner(expectedWallet: string): Promise<{ privateKey: string; address: string; source: string }> {
+async function readJsonFile<T>(filePath: string): Promise<T | null> {
   try {
-    const module = await import("@aibtc/mcp-server/dist/services/wallet-manager.js");
-    const manager = module.getWalletManager();
-    const walletId = process.env.AIBTC_WALLET_ID || (await manager.getActiveWalletId());
-    if (!walletId) throw new Error("No active AIBTC wallet id found");
+    return JSON.parse(await fs.readFile(filePath, "utf8")) as T;
+  } catch {
+    return null;
+  }
+}
 
-    const activeAccount = manager.getActiveAccount?.();
-    if (activeAccount) {
-      if (activeAccount.address !== expectedWallet) {
-        throw new Error(`Active AIBTC wallet resolves to ${activeAccount.address}, expected ${expectedWallet}`);
-      }
-      return { privateKey: activeAccount.privateKey, address: activeAccount.address, source: "AIBTC_ACTIVE_SESSION" };
+function aibtcStoragePath(...parts: string[]): string {
+  return path.join(os.homedir(), ".aibtc", ...parts);
+}
+
+function deriveAesKey(password: string, salt: Buffer, params: EncryptedData["scryptParams"]): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    crypto.scrypt(password, salt, params.keyLen, { N: params.N, r: params.r, p: params.p }, (error, key) => {
+      if (error) reject(error);
+      else resolve(key);
+    });
+  });
+}
+
+async function decryptKeystoreMnemonic(encrypted: EncryptedData, password: string): Promise<string> {
+  const key = await deriveAesKey(password, Buffer.from(encrypted.salt, "base64"), encrypted.scryptParams);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(encrypted.iv, "base64"));
+  decipher.setAuthTag(Buffer.from(encrypted.authTag, "base64"));
+  try {
+    return Buffer.concat([
+      decipher.update(Buffer.from(encrypted.ciphertext, "base64")),
+      decipher.final(),
+    ]).toString("utf8");
+  } catch {
+    throw new Error("invalid wallet password or corrupted keystore");
+  }
+}
+
+async function decryptSessionAccount(walletId: string): Promise<SerializedAccount | null> {
+  const session = await readJsonFile<SessionFile>(aibtcStoragePath("sessions", `${path.basename(walletId)}.json`));
+  if (!session || session.version !== 1) return null;
+  if (session.expiresAt && new Date(session.expiresAt) < new Date()) return null;
+
+  const sessionKey = await fs.readFile(aibtcStoragePath("sessions", ".session-key")).catch(() => null);
+  if (!sessionKey || sessionKey.length !== 32) return null;
+
+  try {
+    const decipher = crypto.createDecipheriv("aes-256-gcm", sessionKey, Buffer.from(session.encrypted.iv, "base64"));
+    decipher.setAuthTag(Buffer.from(session.encrypted.authTag, "base64"));
+    const decrypted = Buffer.concat([
+      decipher.update(Buffer.from(session.encrypted.ciphertext, "base64")),
+      decipher.final(),
+    ]);
+    return JSON.parse(decrypted.toString("utf8")) as SerializedAccount;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveManagedWalletId(): Promise<string> {
+  if (process.env.AIBTC_WALLET_ID?.trim()) return process.env.AIBTC_WALLET_ID.trim();
+  const config = await readJsonFile<AppConfig>(aibtcStoragePath("config.json"));
+  if (config?.activeWalletId) return config.activeWalletId;
+  throw new Error("No active AIBTC wallet is configured. Set AIBTC_WALLET_ID or select/unlock a wallet before running this write.");
+}
+
+async function resolveManagedWalletSigner(expectedWallet: string): Promise<{ privateKey: string; address: string; source: string }> {
+  const walletId = await resolveManagedWalletId();
+  const index = await readJsonFile<WalletIndex>(aibtcStoragePath("wallets.json"));
+  const metadata = index?.wallets?.find((wallet) => wallet.id === walletId);
+  if (!metadata) throw new Error(`managed wallet id ${walletId} not found in ~/.aibtc/wallets.json`);
+  if (metadata.network !== "mainnet") throw new Error(`managed wallet ${walletId} is ${metadata.network}, expected mainnet`);
+  if (metadata.address !== expectedWallet) {
+    throw new Error(`managed wallet ${walletId} resolves to ${metadata.address}, expected ${expectedWallet}`);
+  }
+
+  const sessionAccount = await decryptSessionAccount(walletId);
+  if (sessionAccount?.privateKey) {
+    if (sessionAccount.address !== expectedWallet) {
+      throw new Error(`managed wallet session resolves to ${sessionAccount.address}, expected ${expectedWallet}`);
     }
+    return { privateKey: sessionAccount.privateKey, address: sessionAccount.address, source: "AIBTC_SESSION_FILE" };
+  }
 
-    const restoredAccount = await manager.restoreSessionFromDisk?.(walletId);
-    if (restoredAccount) {
-      if (restoredAccount.address !== expectedWallet) {
-        throw new Error(`Restored AIBTC wallet resolves to ${restoredAccount.address}, expected ${expectedWallet}`);
-      }
-      return { privateKey: restoredAccount.privateKey, address: restoredAccount.address, source: "AIBTC_RESTORED_SESSION" };
-    }
+  const password = process.env.AIBTC_WALLET_PASSWORD?.trim();
+  if (!password) {
+    throw new Error(`AIBTC_WALLET_PASSWORD is not set for managed wallet ${walletId}`);
+  }
 
-    const clientMnemonic = process.env.CLIENT_MNEMONIC?.trim();
-    if (clientMnemonic) {
+  const keystore = await readJsonFile<KeystoreFile>(aibtcStoragePath("wallets", walletId, "keystore.json"));
+  if (!keystore) throw new Error(`keystore not found for managed wallet ${walletId}`);
+
+  const mnemonic = await decryptKeystoreMnemonic(keystore.encrypted, password);
+  const { generateWallet } = await import("@stacks/wallet-sdk");
+  const wallet = await generateWallet({ secretKey: mnemonic, password: "" });
+  const account = wallet.accounts[0];
+  const address = getAddressFromPrivateKey(account.stxPrivateKey, "mainnet");
+  if (address !== expectedWallet) {
+    throw new Error(`managed wallet keystore resolves to ${address}, expected ${expectedWallet}`);
+  }
+  return { privateKey: account.stxPrivateKey, address, source: "AIBTC_WALLET_PASSWORD" };
+}
+
+async function resolveSigner(expectedWallet: string): Promise<{ privateKey: string; address: string; source: string }> {
+  const attempts: string[] = [];
+
+  try {
+    return await resolveManagedWalletSigner(expectedWallet);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    attempts.push(`managed AIBTC wallet: ${detail}`);
+  }
+
+  const clientMnemonic = process.env.CLIENT_MNEMONIC?.trim();
+  if (clientMnemonic) {
+    try {
       const { generateWallet } = await import("@stacks/wallet-sdk");
       const wallet = await generateWallet({ secretKey: clientMnemonic, password: "" });
       const account = wallet.accounts[0];
       const address = getAddressFromPrivateKey(account.stxPrivateKey, "mainnet");
       if (address !== expectedWallet) {
-        throw new Error(`CLIENT_MNEMONIC resolves to ${address}, expected ${expectedWallet}`);
+        throw new Error(`resolves to ${address}, expected ${expectedWallet}`);
       }
       return { privateKey: account.stxPrivateKey, address, source: "CLIENT_MNEMONIC" };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      attempts.push(`CLIENT_MNEMONIC: ${detail}`);
     }
+  } else {
+    attempts.push("CLIENT_MNEMONIC: not set");
+  }
 
-    const privateKey = process.env.STACKS_PRIVATE_KEY?.trim();
-    if (privateKey) {
+  const privateKey = process.env.STACKS_PRIVATE_KEY?.trim();
+  if (privateKey) {
+    try {
       const address = getAddressFromPrivateKey(privateKey, "mainnet");
       if (address !== expectedWallet) {
-        throw new Error(`STACKS_PRIVATE_KEY resolves to ${address}, expected ${expectedWallet}`);
+        throw new Error(`resolves to ${address}, expected ${expectedWallet}`);
       }
       return { privateKey, address, source: "STACKS_PRIVATE_KEY" };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      attempts.push(`STACKS_PRIVATE_KEY: ${detail}`);
     }
-
-    const password = process.env.AIBTC_WALLET_PASSWORD;
-    if (!password) {
-      throw new Error(
-        "No signer available. Unlock the AIBTC wallet first with wallet_unlock / wallet.ts unlock, or set CLIENT_MNEMONIC, STACKS_PRIVATE_KEY, or AIBTC_WALLET_PASSWORD."
-      );
-    }
-
-    const account = await manager.unlock(walletId, password);
-    if (account.address !== expectedWallet) {
-      throw new Error(`AIBTC wallet resolves to ${account.address}, expected ${expectedWallet}`);
-    }
-    return { privateKey: account.privateKey, address: account.address, source: "AIBTC_WALLET_PASSWORD" };
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`Could not resolve local AIBTC signer: ${detail}`);
+  } else {
+    attempts.push("STACKS_PRIVATE_KEY: not set");
   }
+
+  throw new Error(
+    `Could not resolve local signer. Set AIBTC_WALLET_ID plus AIBTC_WALLET_PASSWORD, unlock the active wallet with wallet/wallet.ts unlock, or set CLIENT_MNEMONIC/STACKS_PRIVATE_KEY. Attempts: ${attempts.join("; ")}`
+  );
 }
 
 async function buildAndBroadcast(context: Context, privateKey: string, fee: bigint) {
