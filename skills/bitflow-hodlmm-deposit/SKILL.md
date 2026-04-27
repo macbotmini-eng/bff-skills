@@ -19,6 +19,8 @@ metadata:
 
 The skill is pool-agnostic across Bitflow HODLMM pools that satisfy the expected liquidity-router, token, `pool-token`, and `pool-token-id` interface.
 
+Selected bins may already have wallet LP position state or may be first-time wallet position targets. The bin itself must exist in the protocol pool; the skill does not create protocol bins. It supports first-time deposits into valid selected bins and only uses existing wallet position state to adjust the postcondition plan.
+
 ## Why agents need it
 
 Agents need a reliable HODLMM entry primitive before they can build full economic loops such as Zest-to-HODLMM routing or HODLMM range deployment. Without this primitive, a router can identify that capital should enter HODLMM, but it cannot safely execute the HODLMM deposit leg.
@@ -30,6 +32,7 @@ Agents need a reliable HODLMM entry primitive before they can build full economi
 - It requires explicit `--confirm=DEPOSIT` before broadcast.
 - It blocks unsupported pool/router/token interfaces before broadcast.
 - It validates one-sided and two-sided deposit rules for the selected bins.
+- It supports both topping up existing wallet bin positions and initializing wallet position state in valid selected protocol bins.
 - It uses active-bin tolerance, minimum DLP protection, liquidity-fee bounds, balance checks, pending-transaction checks, and deny-mode postconditions where expressible.
 - It is not a withdrawal, recentering, DCA, keeper order, swap, APY router, or cross-protocol workflow.
 
