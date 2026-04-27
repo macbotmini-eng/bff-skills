@@ -15,7 +15,6 @@ import {
   intCV,
   listCV,
   makeContractCall,
-  noneCV,
   principalCV,
   someCV,
   tupleCV,
@@ -269,11 +268,11 @@ interface SharedOptions {
   slippageBps?: string;
   activeBinMaxDeviation?: string;
   minGasReserveUstx?: string;
+  feeUstx?: string;
 }
 
 interface RunOptions extends SharedOptions {
   confirm?: string;
-  feeUstx?: string;
   waitSeconds?: string;
 }
 
@@ -430,6 +429,11 @@ function parseNonNegativeInteger(value: string | undefined, fallback: number, la
 
 function normalizeTxId(txid: string): string {
   return txid.startsWith("0x") ? txid : `0x${txid}`;
+}
+
+function stxDepositAmount(context: Pick<Context, "xAsset" | "yAsset" | "totals">): bigint {
+  return (context.xAsset.kind === "stx" ? context.totals.xAmount : 0n)
+    + (context.yAsset.kind === "stx" ? context.totals.yAmount : 0n);
 }
 
 function parseContractId(contractId: string): { address: string; name: string } {
@@ -1018,15 +1022,33 @@ async function collectContext(opts: SharedOptions, requirePlan = true): Promise<
       };
   const stxBalance = tokenBalance({ kind: "stx", contract: "STX", symbol: "STX" }, balances);
   const pendingDepth = Number(pending.total ?? pending.results?.length ?? 0);
+  const fee = asBigInt(opts.feeUstx ?? DEFAULT_FEE_USTX, "--fee-ustx");
+  const stxDeposit = stxDepositAmount({ xAsset, yAsset, totals: selection.totals });
+  const stxRequired = stxDeposit + fee + minGasReserve;
 
-  if (stxBalance < minGasReserve) {
-    throw new Error(`Insufficient STX gas reserve. Need at least ${minGasReserve} uSTX, have ${stxBalance} uSTX`);
+  if (stxBalance < stxRequired) {
+    throw new BlockedError(
+      "INSUFFICIENT_STX_BALANCE",
+      `Insufficient STX balance for deposit, fee, and reserve. Need ${stxDeposit} uSTX deposit + ${fee} uSTX fee + ${minGasReserve} uSTX reserve = ${stxRequired} uSTX, have ${stxBalance} uSTX.`,
+      "Reduce the STX-side deposit amount, lower --fee-ustx or --min-gas-reserve-ustx, or fund the wallet with more STX.",
+      { stxDeposit, feeUstx: fee, minGasReserveUstx: minGasReserve, requiredUstx: stxRequired, availableUstx: stxBalance }
+    );
   }
   if (selection.totals.xAmount > xAsset.balance) {
-    throw new Error(`Insufficient ${xAsset.symbol} balance. Need ${selection.totals.xAmount}, have ${xAsset.balance}.`);
+    throw new BlockedError(
+      "INSUFFICIENT_TOKEN_X_BALANCE",
+      `Insufficient ${xAsset.symbol} balance. Need ${selection.totals.xAmount}, have ${xAsset.balance}.`,
+      "Reduce --amount-x or fund the wallet with more token X.",
+      { symbol: xAsset.symbol, required: selection.totals.xAmount, available: xAsset.balance }
+    );
   }
   if (selection.totals.yAmount > yAsset.balance) {
-    throw new Error(`Insufficient ${yAsset.symbol} balance. Need ${selection.totals.yAmount}, have ${yAsset.balance}.`);
+    throw new BlockedError(
+      "INSUFFICIENT_TOKEN_Y_BALANCE",
+      `Insufficient ${yAsset.symbol} balance. Need ${selection.totals.yAmount}, have ${yAsset.balance}.`,
+      "Reduce --amount-y or fund the wallet with more token Y.",
+      { symbol: yAsset.symbol, required: selection.totals.yAmount, available: yAsset.balance }
+    );
   }
 
   return {
@@ -1300,7 +1322,7 @@ async function buildAndBroadcast(context: Context, privateKey: string, fee: bigi
       contractPrincipalCV(poolAddress, poolName),
       contractPrincipalCV(xAddress, xName),
       contractPrincipalCV(yAddress, yName),
-      context.selection.activeBinMaxDeviation >= 0 ? activeBinTolerance : noneCV(),
+      activeBinTolerance,
     ],
     senderKey: privateKey,
     network: STACKS_MAINNET,
@@ -1317,7 +1339,6 @@ async function buildAndBroadcast(context: Context, privateKey: string, fee: bigi
 
   return {
     txid: normalizeTxId(result.txid),
-    rawTx: transaction.serialize(),
     postConditionCount: postConditions.length,
   };
 }
@@ -1459,7 +1480,7 @@ function addSharedOptions(command: Command): Command {
     .option("--distribution <mode>", "distribution mode: equal or explicit", "equal")
     .option("--slippage-bps <bps>", "slippage tolerance in basis points", String(DEFAULT_SLIPPAGE_BPS))
     .option("--active-bin-max-deviation <bins>", "max active-bin drift tolerated before revert", String(DEFAULT_ACTIVE_BIN_MAX_DEVIATION))
-    .option("--min-gas-reserve-ustx <uSTX>", "minimum STX gas reserve before write", DEFAULT_MIN_GAS_RESERVE_USTX.toString());
+    .option("--min-gas-reserve-ustx <uSTX>", "minimum STX balance to preserve after deposit and fee", DEFAULT_MIN_GAS_RESERVE_USTX.toString());
 }
 
 const program = new Command();

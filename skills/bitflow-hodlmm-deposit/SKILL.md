@@ -90,7 +90,7 @@ The skill exposes the same kind of strategy surface as the withdrawal primitive,
 | `--plan-json <json>` | No | Explicit per-bin amounts for advanced agent composition. |
 | `--slippage-bps <bps>` | No | Minimum DLP and fee-bound tolerance. |
 | `--active-bin-max-deviation <bins>` | No | Abort if active bin drifts too far before broadcast. |
-| `--min-gas-reserve-ustx <uSTX>` | No | Minimum STX reserve before write. |
+| `--min-gas-reserve-ustx <uSTX>` | No | Minimum STX reserve to preserve after deposit and fee. |
 | `--confirm DEPOSIT` | Run only | Explicit write confirmation. |
 | `--wait-seconds <seconds>` | No | Inclusion/status wait window. |
 
@@ -133,6 +133,7 @@ Fatal error:
 - The selected pool must be a live Bitflow HODLMM pool with the shared `dlmm-liquidity-router-v-1-1` interface.
 - The proof path targets `add-relative-liquidity-same-multi`.
 - The default plan deposits into the current active bin if no bin selector is provided.
+- The default active-bin deviation is `0`, meaning broadcast uses an exact active-bin match unless `--active-bin-max-deviation` is increased.
 - Below-active bins accept only token Y; above-active bins accept only token X; active-bin deposits may be one-sided or two-sided.
 - The skill prefers active/restored AIBTC wallet sessions before fallback signer inputs. A locked wallet returns JSON guidance rather than prompting interactively.
 - Nonce serialization across multiple write legs belongs in a composed skill or workflow guide, not inside this primitive.
