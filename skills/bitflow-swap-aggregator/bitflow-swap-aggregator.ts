@@ -3,6 +3,8 @@
 import { Command } from "commander";
 import {
   AnchorMode,
+  type ClarityValue,
+  type PostCondition,
   PostConditionMode,
   broadcastTransaction,
   cvToJSON,
@@ -50,6 +52,41 @@ interface RunOptions extends SharedOptions {
   confirm?: string;
 }
 
+interface BitflowRouteQuote {
+  bestRoute: {
+    route: unknown;
+    quote?: number | null;
+    tokenPath?: string[];
+    dexPath?: string[];
+    tokenXDecimals?: number;
+    tokenYDecimals?: number;
+    priceImpact?: unknown;
+  } | null;
+}
+
+interface BitflowSwapParams {
+  contractAddress: string;
+  contractName: string;
+  functionName: string;
+  functionArgs: ClarityValue[];
+  postConditions: PostCondition[];
+}
+
+interface BitflowSdkLike {
+  getAvailableTokens(): Promise<unknown[]>;
+  getQuoteForRoute(tokenIn: string, tokenOut: string, amountIn: number): Promise<BitflowRouteQuote>;
+  prepareSwap?: (
+    swapExecutionData: { route: unknown; amount: number; tokenXDecimals: number; tokenYDecimals: number },
+    senderAddress: string,
+    slippageTolerance?: number
+  ) => Promise<BitflowSwapParams>;
+  getSwapParams?: (
+    swapExecutionData: { route: unknown; amount: number; tokenXDecimals: number; tokenYDecimals: number },
+    senderAddress: string,
+    slippageTolerance?: number
+  ) => Promise<BitflowSwapParams>;
+}
+
 interface Context {
   wallet: string;
   tokenIn: TokenInfo;
@@ -64,8 +101,8 @@ interface Context {
   inputBalance: bigint;
   outputBalance: bigint;
   stxAvailable: bigint;
-  quote: any;
-  swapParams: any;
+  quote: BitflowRouteQuote | null;
+  swapParams: BitflowSwapParams | null;
 }
 
 interface SessionFile {
@@ -79,10 +116,11 @@ const HIRO_API = process.env.STACKS_API_HOST || "https://api.hiro.so";
 const EXPLORER = "https://explorer.hiro.so/txid";
 const CONFIRM_TOKEN = "SWAP";
 const DEFAULT_WAIT_SECONDS = 240;
+const DEFAULT_SDK_TIMEOUT_MS = 25_000;
 const DEFAULT_FEE_USTX = 70_000n;
 const DEFAULT_MIN_GAS_RESERVE_USTX = 500_000n;
 const DEFAULT_SLIPPAGE_BPS = 100;
-const DEFAULT_MEMPOOL_DEPTH_LIMIT = 0;
+const DEFAULT_MEMPOOL_DEPTH_LIMIT = 3;
 
 class BlockedError extends Error {
   constructor(
@@ -106,7 +144,7 @@ function stringify(value: unknown): Json {
 }
 
 function output(status: Status, action: string, data: JsonMap, error: JsonMap | null): void {
-  console.log(JSON.stringify({ status, action, data: stringify(data), error: stringify(error) }, null, 2));
+  process.stdout.write(`${JSON.stringify({ status, action, data: stringify(data), error: stringify(error) }, null, 2)}\n`);
 }
 
 function success(action: string, data: JsonMap): void {
@@ -124,6 +162,9 @@ function fail(action: string, error: unknown): void {
   }
   const message = error instanceof Error ? error.message : String(error);
   output("error", action, {}, { code: "ERROR", message, next: "Run doctor/status and inspect the failing check before retrying." });
+  if (message.startsWith("SDK_TIMEOUT:")) {
+    process.exit(1);
+  }
 }
 
 function parseContractId(contractId: string): { address: string; name: string } {
@@ -175,8 +216,8 @@ async function fetchJson<T>(url: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-async function createBitflowSdk(): Promise<any> {
-  const { BitflowSDK } = await import("@bitflowlabs/core-sdk" as any);
+async function createBitflowSdk(): Promise<BitflowSdkLike> {
+  const { BitflowSDK } = await import("@bitflowlabs/core-sdk") as any;
   return new BitflowSDK({
     BITFLOW_API_HOST: process.env.BITFLOW_API_HOST || "https://api.bitflowapis.finance",
     API_HOST: process.env.API_HOST || "https://api.bitflowapis.finance",
@@ -187,19 +228,44 @@ async function createBitflowSdk(): Promise<any> {
   });
 }
 
+const originalConsole = {
+  warn: console.warn,
+  error: console.error,
+  log: console.log,
+};
+let quietSdkDepth = 0;
+
 async function quietSdk<T>(fn: () => Promise<T>): Promise<T> {
-  const originalWarn = console.warn;
-  const originalError = console.error;
-  const originalLog = console.log;
-  console.warn = () => {};
-  console.error = () => {};
-  console.log = () => {};
+  if (quietSdkDepth === 0) {
+    console.warn = () => {};
+    console.error = () => {};
+    console.log = () => {};
+  }
+  quietSdkDepth += 1;
   try {
     return await fn();
   } finally {
-    console.warn = originalWarn;
-    console.error = originalError;
-    console.log = originalLog;
+    quietSdkDepth = Math.max(quietSdkDepth - 1, 0);
+    if (quietSdkDepth === 0) {
+      console.warn = originalConsole.warn;
+      console.error = originalConsole.error;
+      console.log = originalConsole.log;
+    }
+  }
+}
+
+async function sdkCall<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  const timeoutMs = parseInteger(process.env.BITFLOW_SDK_TIMEOUT_MS, DEFAULT_SDK_TIMEOUT_MS, "BITFLOW_SDK_TIMEOUT_MS");
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      quietSdk(fn),
+      new Promise<T>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`SDK_TIMEOUT: ${label} exceeded ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
 }
 
@@ -218,8 +284,8 @@ function normalizeToken(raw: any): TokenInfo {
   };
 }
 
-async function getTokens(sdk: any): Promise<TokenInfo[]> {
-  const tokens = await quietSdk(() => sdk.getAvailableTokens());
+async function getTokens(sdk: BitflowSdkLike): Promise<TokenInfo[]> {
+  const tokens = await sdkCall("getAvailableTokens", () => sdk.getAvailableTokens());
   return tokens.map(normalizeToken);
 }
 
@@ -235,9 +301,13 @@ function matchesToken(token: TokenInfo, selector: string): boolean {
   );
 }
 
-async function resolveToken(sdk: any, selector: string | undefined, label: string): Promise<TokenInfo> {
+async function resolveToken(sdk: BitflowSdkLike, selector: string | undefined, label: string): Promise<TokenInfo> {
+  return resolveTokenFromList(await getTokens(sdk), selector, label);
+}
+
+function resolveTokenFromList(tokens: TokenInfo[], selector: string | undefined, label: string): TokenInfo {
   if (!selector) throw new Error(`${label} is required`);
-  const matches = (await getTokens(sdk)).filter((token) => matchesToken(token, selector));
+  const matches = tokens.filter((token) => matchesToken(token, selector));
   if (matches.length === 0) {
     throw new BlockedError("TOKEN_NOT_FOUND", `Could not resolve ${label}: ${selector}`, "Run tokens --search <symbol> and use a live Bitflow token ID.", { selector });
   }
@@ -289,9 +359,9 @@ async function getFtBalance(wallet: string, token: TokenInfo): Promise<bigint> {
   return BigInt(String(json.value?.value ?? json.value));
 }
 
-function routeSummary(quote: any): JsonMap {
+function routeSummary(quote: BitflowRouteQuote | null): JsonMap {
   const best = quote?.bestRoute ?? null;
-  const route = best?.route ?? null;
+  const route = (best?.route ?? null) as any;
   return {
     quote: best?.quote ?? quote?.quote ?? null,
     tokenPath: best?.tokenPath ?? route?.token_path ?? null,
@@ -307,7 +377,25 @@ function routeSummary(quote: any): JsonMap {
   };
 }
 
-async function prepareSwap(sdk: any, context: Omit<Context, "swapParams">): Promise<any> {
+function assertSwapParams(raw: unknown): BitflowSwapParams {
+  const params = raw as Partial<BitflowSwapParams> | null;
+  if (
+    !params ||
+    typeof params.contractAddress !== "string" ||
+    typeof params.contractName !== "string" ||
+    typeof params.functionName !== "string" ||
+    !Array.isArray(params.functionArgs) ||
+    !Array.isArray(params.postConditions)
+  ) {
+    throw new BlockedError("PREPARE_SWAP_FAILED", "Bitflow SDK did not return complete executable swap parameters.", "Inspect quote output and retry later.");
+  }
+  return params as BitflowSwapParams;
+}
+
+async function prepareSwap(sdk: BitflowSdkLike, context: Omit<Context, "swapParams">): Promise<BitflowSwapParams> {
+  if (!context.quote?.bestRoute?.route) {
+    throw new BlockedError("NO_ROUTE", "Bitflow aggregator did not return an executable route.", "Try a different token pair or amount.");
+  }
   const swapExecutionData = {
     route: context.quote.bestRoute.route,
     amount: context.amountHuman,
@@ -315,9 +403,12 @@ async function prepareSwap(sdk: any, context: Omit<Context, "swapParams">): Prom
     tokenYDecimals: context.tokenOut.tokenDecimals,
   };
   if (typeof sdk.prepareSwap === "function") {
-    return quietSdk(() => sdk.prepareSwap(swapExecutionData, context.wallet, context.slippageDecimal));
+    return assertSwapParams(await sdkCall("prepareSwap", () => sdk.prepareSwap!(swapExecutionData, context.wallet, context.slippageDecimal)));
   }
-  return quietSdk(() => sdk.getSwapParams(swapExecutionData, context.wallet, context.slippageDecimal));
+  if (typeof sdk.getSwapParams === "function") {
+    return assertSwapParams(await sdkCall("getSwapParams", () => sdk.getSwapParams!(swapExecutionData, context.wallet, context.slippageDecimal)));
+  }
+  throw new BlockedError("PREPARE_SWAP_UNAVAILABLE", "Bitflow SDK does not expose prepareSwap or getSwapParams.", "Use an SDK version with executable swap preparation support.");
 }
 
 function postconditionSummary(postConditions: unknown[]): Json[] {
@@ -342,10 +433,9 @@ async function buildContext(opts: SharedOptions, requireAmount: boolean): Promis
   }
   if (!opts.wallet) throw new Error("--wallet is required");
   const sdk = await createBitflowSdk();
-  const [tokenIn, tokenOut] = await Promise.all([
-    resolveToken(sdk, opts.tokenIn, "--token-in"),
-    resolveToken(sdk, opts.tokenOut, "--token-out"),
-  ]);
+  const tokens = await getTokens(sdk);
+  const tokenIn = resolveTokenFromList(tokens, opts.tokenIn, "--token-in");
+  const tokenOut = resolveTokenFromList(tokens, opts.tokenOut, "--token-out");
   const amountHuman = opts.amountIn ? parsePositiveHuman(opts.amountIn, "--amount-in") : 0;
   const amountAtomic = opts.amountIn ? decimalToAtomic(opts.amountIn, tokenIn.tokenDecimals) : 0n;
   if (requireAmount && amountAtomic <= 0n) throw new Error("--amount-in is required");
@@ -355,7 +445,7 @@ async function buildContext(opts: SharedOptions, requireAmount: boolean): Promis
   const minGasReserve = parseNonNegativeBigInt(opts.minGasReserveUstx, DEFAULT_MIN_GAS_RESERVE_USTX, "--min-gas-reserve-ustx");
   const mempoolDepthLimit = parseInteger(opts.mempoolDepthLimit, DEFAULT_MEMPOOL_DEPTH_LIMIT, "--mempool-depth-limit");
   const [quote, inputBalance, outputBalance, stxAvailable, pendingDepth] = await Promise.all([
-    requireAmount ? quietSdk(() => sdk.getQuoteForRoute(tokenIn.tokenId, tokenOut.tokenId, amountHuman)) : Promise.resolve(null),
+    requireAmount ? sdkCall("getQuoteForRoute", () => sdk.getQuoteForRoute(tokenIn.tokenId, tokenOut.tokenId, amountHuman)) : Promise.resolve(null),
     getFtBalance(opts.wallet, tokenIn),
     getFtBalance(opts.wallet, tokenOut),
     getStxAvailable(opts.wallet),
@@ -477,11 +567,11 @@ async function decryptKeystoreAccount(walletId: string, password: string): Promi
   if (keystore.encrypted?.ciphertext) {
     mnemonic = await decryptAibtcKeystore(keystore.encrypted, password);
   } else if (keystore.encryptedMnemonic ?? keystore.encrypted_mnemonic) {
-    const { decryptMnemonic } = await import("@stacks/encryption" as any);
+    const { decryptMnemonic } = await import("@stacks/encryption") as any;
     mnemonic = await decryptMnemonic(keystore.encryptedMnemonic ?? keystore.encrypted_mnemonic, password);
   }
   if (!mnemonic) throw new Error("Unsupported AIBTC keystore format");
-  const { generateWallet, deriveAccount, getStxAddress } = await import("@stacks/wallet-sdk" as any);
+  const { generateWallet, deriveAccount, getStxAddress } = await import("@stacks/wallet-sdk") as any;
   const wallet = await generateWallet({ secretKey: mnemonic, password: "" });
   const account = wallet.accounts[0] ?? deriveAccount(wallet, 0);
   return { privateKey: account.stxPrivateKey, address: getStxAddress(account), source: "AIBTC_KEYSTORE" };
@@ -610,12 +700,11 @@ async function runTokens(opts: SharedOptions) {
 async function runQuote(opts: SharedOptions) {
   try {
     const sdk = await createBitflowSdk();
-    const [tokenIn, tokenOut] = await Promise.all([
-      resolveToken(sdk, opts.tokenIn, "--token-in"),
-      resolveToken(sdk, opts.tokenOut, "--token-out"),
-    ]);
+    const tokens = await getTokens(sdk);
+    const tokenIn = resolveTokenFromList(tokens, opts.tokenIn, "--token-in");
+    const tokenOut = resolveTokenFromList(tokens, opts.tokenOut, "--token-out");
     const amountHuman = parsePositiveHuman(opts.amountIn, "--amount-in");
-    const quote = await quietSdk(() => sdk.getQuoteForRoute(tokenIn.tokenId, tokenOut.tokenId, amountHuman));
+    const quote = await sdkCall("getQuoteForRoute", () => sdk.getQuoteForRoute(tokenIn.tokenId, tokenOut.tokenId, amountHuman));
     if (!quote?.bestRoute?.route) {
       throw new BlockedError("NO_ROUTE", "Bitflow aggregator did not return an executable route.", "Try a different token pair or amount.", { tokenIn: tokenIn.tokenId, tokenOut: tokenOut.tokenId, amountIn: amountHuman });
     }
@@ -648,13 +737,17 @@ async function runSwap(opts: RunOptions) {
     if (context.pendingDepth > context.mempoolDepthLimit) {
       throw new BlockedError("PENDING_TX_DEPTH", "Wallet has pending STX transactions above the configured limit.", "Wait for pending transactions to settle before broadcasting.", { pendingDepth: context.pendingDepth, mempoolDepthLimit: context.mempoolDepthLimit });
     }
+    if (!context.swapParams) {
+      throw new BlockedError("PREPARE_SWAP_FAILED", "Bitflow SDK did not return executable swap parameters.", "Inspect plan output and retry later.");
+    }
+    const swapParams = context.swapParams;
     const signer = await resolveSigner(context.wallet);
     const tx = await makeContractCall({
-      contractAddress: context.swapParams.contractAddress,
-      contractName: context.swapParams.contractName,
-      functionName: context.swapParams.functionName,
-      functionArgs: context.swapParams.functionArgs,
-      postConditions: context.swapParams.postConditions,
+      contractAddress: swapParams.contractAddress,
+      contractName: swapParams.contractName,
+      functionName: swapParams.functionName,
+      functionArgs: swapParams.functionArgs,
+      postConditions: swapParams.postConditions,
       postConditionMode: PostConditionMode.Deny,
       network: STACKS_MAINNET,
       senderKey: signer.privateKey,
@@ -667,8 +760,8 @@ async function runSwap(opts: RunOptions) {
     const proof = txProof(
       txid,
       mined,
-      { contract: `${context.swapParams.contractAddress}.${context.swapParams.contractName}`, functionName: context.swapParams.functionName },
-      Array.isArray(context.swapParams.postConditions) ? context.swapParams.postConditions.length : 0
+      { contract: `${swapParams.contractAddress}.${swapParams.contractName}`, functionName: swapParams.functionName },
+      Array.isArray(swapParams.postConditions) ? swapParams.postConditions.length : 0
     );
     const [inputBalanceAfter, outputBalanceAfter, stxAvailableAfter] = await Promise.all([
       getFtBalance(context.wallet, context.tokenIn),
