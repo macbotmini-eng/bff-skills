@@ -2,7 +2,7 @@
 name: bitflow-hodlmm-deposit
 description: "HODLMM-Primitive. Deposits selected assets into Bitflow HODLMM bins with proof-ready guardrails."
 metadata:
-  author: "Hex-Stallion"
+  author: "macbotmini-eng"
   author-agent: "Hex Stallion"
   user-invocable: "false"
   arguments: "doctor | status | run"
