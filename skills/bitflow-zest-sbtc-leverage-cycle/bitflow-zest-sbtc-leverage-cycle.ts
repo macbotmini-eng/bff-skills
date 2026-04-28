@@ -302,7 +302,7 @@ function aibtcPath(...parts: string[]): string {
 }
 
 function checkpointPath(wallet: string): string {
-  return aibtcPath("state", "bitflow-zest-sbtc-leverage-loop", `${wallet}.json`);
+  return aibtcPath("state", "bitflow-zest-sbtc-leverage-cycle", `${wallet}.json`);
 }
 
 async function readCheckpoint(wallet: string): Promise<Checkpoint | null> {
@@ -449,7 +449,7 @@ async function checkContracts(wallet: string): Promise<JsonMap> {
 
 async function collectContext(opts: SharedOptions, requireAmount: boolean) {
   if (process.env.NETWORK && process.env.NETWORK !== "mainnet") {
-    throw new BlockedError("MAINNET_ONLY", "bitflow-zest-sbtc-leverage-loop is mainnet-only.", "Set NETWORK=mainnet.");
+    throw new BlockedError("MAINNET_ONLY", "bitflow-zest-sbtc-leverage-cycle is mainnet-only.", "Set NETWORK=mainnet.");
   }
   if (!opts.wallet) throw new Error("--wallet is required");
   const borrowAmount = requireAmount ? parsePositiveBigInt(opts.borrowAmountUstx, "--borrow-amount-ustx") : (opts.borrowAmountUstx ? parsePositiveBigInt(opts.borrowAmountUstx, "--borrow-amount-ustx") : 0n);
@@ -1014,12 +1014,12 @@ function addSharedOptions(command: Command): Command {
 }
 
 const program = new Command();
-program.name("bitflow-zest-sbtc-leverage-loop").description("Execute one full Bitflow + Zest sBTC leverage loop with resume safety.");
+program.name("bitflow-zest-sbtc-leverage-cycle").description("Execute one Bitflow + Zest sBTC leverage cycle with resume safety.");
 
 addSharedOptions(program.command("doctor").description("Check dependency and wallet readiness"))
   .action((opts: SharedOptions) => runDoctor(opts).catch((error) => fail("doctor", error)));
 
-addSharedOptions(program.command("status").description("Read Zest position and checkpoint state"))
+addSharedOptions(program.command("status").description("Read Zest position and saved cycle state"))
   .action((opts: SharedOptions) => runStatus(opts).catch((error) => fail("status", error)));
 
 addSharedOptions(program.command("plan").description("Preview one leverage cycle without broadcasting"))
@@ -1030,12 +1030,12 @@ addSharedOptions(program.command("run").description("Broadcast one confirmed lev
   .option("--fee-ustx <uSTX>", "fee per transaction in micro-STX", DEFAULT_FEE_USTX.toString())
   .action((opts: RunOptions) => runCycle(opts).catch((error) => fail("run", error)));
 
-addSharedOptions(program.command("resume").description("Inspect/resume a partial checkpoint"))
+addSharedOptions(program.command("resume").description("Inspect/resume a partial saved cycle state"))
   .option("--confirm <token>", "reserved for future automatic resume")
   .option("--fee-ustx <uSTX>", "fee per transaction in micro-STX", DEFAULT_FEE_USTX.toString())
   .action((opts: RunOptions) => runResume(opts).catch((error) => fail("resume", error)));
 
-addSharedOptions(program.command("cancel").description("Mark an unresolved checkpoint as operator-cancelled"))
+addSharedOptions(program.command("cancel").description("Mark unresolved saved cycle state as operator-cancelled"))
   .action((opts: SharedOptions) => runCancel(opts).catch((error) => fail("cancel", error)));
 
 program.parse(process.argv);

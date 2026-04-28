@@ -1,23 +1,26 @@
 ---
-name: bitflow-zest-sbtc-leverage-loop
-description: "Executes one full Bitflow + Zest sBTC leverage loop with resume safety."
+name: bitflow-zest-sbtc-leverage-cycle
+description: "Executes one Bitflow + Zest sBTC leverage cycle with resume safety."
 metadata:
   author: "macbotmini-eng"
   author-agent: "Hex Stallion"
   user-invocable: "false"
   arguments: "doctor | status | plan | run | resume | cancel"
-  entry: "bitflow-zest-sbtc-leverage-loop/bitflow-zest-sbtc-leverage-loop.ts"
+  entry: "bitflow-zest-sbtc-leverage-cycle/bitflow-zest-sbtc-leverage-cycle.ts"
   requires: "wallet, signing, settings, zest-borrow-asset-primitive, zest-asset-deposit-primitive, bitflow"
   tags: "defi, write, mainnet-only, requires-funds, infrastructure, l2"
 ---
 
-# Bitflow + Zest sBTC Leverage Loop
+# Bitflow + Zest sBTC Leverage Cycle
 
 ## What it does
 
-`bitflow-zest-sbtc-leverage-loop` executes exactly one full leverage loop:
+`bitflow-zest-sbtc-leverage-cycle` executes exactly one forward leverage cycle:
 borrow STX against existing Zest sBTC collateral, swap the borrowed STX to sBTC
 through Bitflow, then resupply the received sBTC to Zest collateral.
+
+This is not a closed loop. Closing the position requires a separate unwind flow:
+repay debt, redeem collateral, and optionally swap back.
 
 It saves progress between every confirmed write leg so agents can detect and
 stop on partial-cycle state instead of blindly starting a new cycle.
@@ -25,11 +28,11 @@ stop on partial-cycle state instead of blindly starting a new cycle.
 ## Why agents need it
 
 Leveraged sBTC is not a single contract call. An agent needs confirmation,
-fresh quote handling, and checkpointing across borrow, swap, and resupply. This
+fresh quote handling, and saved progress across borrow, swap, and resupply. This
 skill provides that controller surface after the individual Zest borrow and
 Zest deposit primitives have been proven.
 
-## Loop steps
+## Cycle steps
 
 1. Start with existing sBTC collateral in Zest.
 2. Borrow STX from Zest against that collateral.
@@ -38,7 +41,7 @@ Zest deposit primitives have been proven.
 5. Swap STX to sBTC through Bitflow.
 6. Wait for the swap transaction to confirm and save progress.
 7. Resupply the received sBTC into Zest collateral.
-8. Wait for the resupply transaction to confirm and mark the loop complete.
+8. Wait for the resupply transaction to confirm and mark the cycle complete.
 
 ```mermaid
 flowchart TD
@@ -48,7 +51,8 @@ flowchart TD
   D --> E["Swap STX to sBTC through Bitflow"]
   E --> F["Confirm swap and save progress"]
   F --> G["Resupply sBTC to Zest collateral"]
-  G --> H["Confirm resupply and complete loop"]
+  G --> H["Confirm resupply and complete cycle"]
+  H -. "Closed round trip requires separate unwind" .-> I["Repay debt + redeem collateral + swap back"]
 ```
 
 ## Safety notes
@@ -57,31 +61,31 @@ flowchart TD
 - It creates debt and moves funds.
 - It is mainnet-only.
 - `run` requires `--confirm=CYCLE`.
-- The controller runs one cycle only. It does not auto-loop.
+- The controller runs one forward cycle only. It does not auto-loop and does not close/unwind the position.
 - The swap quote is fetched only after borrow confirmation.
 - Every write leg uses `PostConditionMode.Deny`.
-- A checkpoint is written before and after each broadcast.
+- Saved progress is written before and after each broadcast.
 - If any leg fails or returns an unknown status, the controller blocks with a
-  partial-cycle checkpoint.
+  partial-cycle saved state.
 
 ## Commands
 
 ### doctor
 
 Checks Zest V2 ABI readiness, Bitflow availability, wallet gas, pending
-transaction depth, and checkpoint state.
+transaction depth, and saved cycle state.
 
 ```bash
-bun run skills/bitflow-zest-sbtc-leverage-loop/bitflow-zest-sbtc-leverage-loop.ts doctor --wallet <stacks-address>
+bun run skills/bitflow-zest-sbtc-leverage-cycle/bitflow-zest-sbtc-leverage-cycle.ts doctor --wallet <stacks-address>
 ```
 
 ### status
 
-Reads the wallet's Zest position, sBTC balance, STX debt, and current checkpoint
+Reads the wallet's Zest position, sBTC balance, STX debt, and current saved state
 state. It never broadcasts.
 
 ```bash
-bun run skills/bitflow-zest-sbtc-leverage-loop/bitflow-zest-sbtc-leverage-loop.ts status --wallet <stacks-address>
+bun run skills/bitflow-zest-sbtc-leverage-cycle/bitflow-zest-sbtc-leverage-cycle.ts status --wallet <stacks-address>
 ```
 
 ### plan
@@ -90,7 +94,7 @@ Previews one cycle and fetches a current Bitflow STX to sBTC quote. It never
 broadcasts.
 
 ```bash
-bun run skills/bitflow-zest-sbtc-leverage-loop/bitflow-zest-sbtc-leverage-loop.ts plan --wallet <stacks-address> --borrow-amount-ustx <uSTX>
+bun run skills/bitflow-zest-sbtc-leverage-cycle/bitflow-zest-sbtc-leverage-cycle.ts plan --wallet <stacks-address> --borrow-amount-ustx <uSTX>
 ```
 
 ### run
@@ -99,24 +103,24 @@ Executes one confirmed borrow, swap, and resupply cycle. It refuses without
 explicit confirmation.
 
 ```bash
-bun run skills/bitflow-zest-sbtc-leverage-loop/bitflow-zest-sbtc-leverage-loop.ts run --wallet <stacks-address> --borrow-amount-ustx <uSTX> --confirm=CYCLE
+bun run skills/bitflow-zest-sbtc-leverage-cycle/bitflow-zest-sbtc-leverage-cycle.ts run --wallet <stacks-address> --borrow-amount-ustx <uSTX> --confirm=CYCLE
 ```
 
 ### resume
 
-Reports the existing checkpoint. It can continue from a confirmed borrow or
-confirmed swap checkpoint only after `--confirm=CYCLE`.
+Reports the existing saved state. It can continue from a confirmed borrow or
+confirmed swap state only after `--confirm=CYCLE`.
 
 ```bash
-bun run skills/bitflow-zest-sbtc-leverage-loop/bitflow-zest-sbtc-leverage-loop.ts resume --wallet <stacks-address>
+bun run skills/bitflow-zest-sbtc-leverage-cycle/bitflow-zest-sbtc-leverage-cycle.ts resume --wallet <stacks-address>
 ```
 
 ### cancel
 
-Marks an unresolved checkpoint as operator-cancelled after review.
+Marks an unresolved saved state as operator-cancelled after review.
 
 ```bash
-bun run skills/bitflow-zest-sbtc-leverage-loop/bitflow-zest-sbtc-leverage-loop.ts cancel --wallet <stacks-address>
+bun run skills/bitflow-zest-sbtc-leverage-cycle/bitflow-zest-sbtc-leverage-cycle.ts cancel --wallet <stacks-address>
 ```
 
 ## Output contract
