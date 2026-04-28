@@ -158,10 +158,12 @@ function blocked(action: string, code: string, message: string, next: string, da
 function fail(action: string, error: unknown): void {
   if (error instanceof BlockedError) {
     blocked(action, error.code, error.message, error.next, error.data);
+    process.exit(0);
     return;
   }
   const message = error instanceof Error ? error.message : String(error);
   output("error", action, {}, { code: "ERROR", message, next: "Run doctor/status and inspect the failing check before retrying." });
+  process.exitCode = 1;
   if (message.startsWith("SDK_TIMEOUT:")) {
     process.exit(1);
   }
@@ -311,8 +313,23 @@ function resolveTokenFromList(tokens: TokenInfo[], selector: string | undefined,
   if (matches.length === 0) {
     throw new BlockedError("TOKEN_NOT_FOUND", `Could not resolve ${label}: ${selector}`, "Run tokens --search <symbol> and use a live Bitflow token ID.", { selector });
   }
-  const exact = matches.find((token) => token.tokenId.toLowerCase() === selector.toLowerCase() || token.symbol.toLowerCase() === selector.toLowerCase());
-  return exact ?? matches[0];
+  const needle = selector.toLowerCase();
+  const exactMatches = matches.filter(
+    (token) =>
+      token.tokenId.toLowerCase() === needle ||
+      token.symbol.toLowerCase() === needle ||
+      token.tokenContract?.toLowerCase() === needle
+  );
+  if (exactMatches.length === 1) return exactMatches[0];
+  if (exactMatches.length > 1 || matches.length > 1) {
+    throw new BlockedError(
+      "AMBIGUOUS_TOKEN",
+      `Ambiguous ${label}: ${selector}`,
+      "Run tokens --search <selector> and rerun with a specific token ID or contract ID.",
+      { selector, candidates: matches.map(tokenSummary) }
+    );
+  }
+  return matches[0];
 }
 
 function tokenSummary(token: TokenInfo): JsonMap {
@@ -770,7 +787,11 @@ async function runSwap(opts: RunOptions) {
     ]);
     const balancesAfter = { inputBalance: inputBalanceAfter, outputBalance: outputBalanceAfter, stxAvailable: stxAvailableAfter };
     if (proof.status !== "success") {
-      throw new BlockedError("TX_NOT_SUCCESS", `Broadcast transaction finished with status ${proof.status}.`, "Inspect the proof payload, adjust the plan, and retry only after the blocker is understood.", {
+      const message =
+        proof.status === "not_indexed"
+          ? "Broadcast transaction was not confirmed as success within the wait window."
+          : `Broadcast transaction finished with status ${proof.status}.`;
+      throw new BlockedError("TX_NOT_SUCCESS", message, "Inspect the proof payload, adjust the plan, and retry only after the blocker is understood.", {
         ...contextData(context),
         signer: { source: signer.source, address: signer.address },
         proof,
