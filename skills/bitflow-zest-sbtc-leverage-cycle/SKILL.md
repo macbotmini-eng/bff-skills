@@ -81,7 +81,7 @@ bun run skills/bitflow-zest-sbtc-leverage-cycle/bitflow-zest-sbtc-leverage-cycle
 
 ### status
 
-Reads the wallet's Zest position, sBTC balance, STX debt, and current saved state
+Reads the wallet's Zest position, sBTC balance, STX debt, and current saved cycle
 state. It never broadcasts.
 
 ```bash
@@ -105,6 +105,11 @@ explicit confirmation.
 ```bash
 bun run skills/bitflow-zest-sbtc-leverage-cycle/bitflow-zest-sbtc-leverage-cycle.ts run --wallet <stacks-address> --borrow-amount-ustx <uSTX> --confirm=CYCLE
 ```
+
+Useful safety options:
+
+- `--pyth-max-fee-ustx <uSTX>` sets the maximum STX the borrow leg may spend on Pyth oracle fees. The default is `10`.
+- `--fee-ustx <uSTX>` sets the transaction fee used for each write leg.
 
 ### resume
 

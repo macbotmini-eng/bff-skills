@@ -50,6 +50,7 @@ interface SharedOptions {
   minGasReserveUstx?: string;
   mempoolDepthLimit?: string;
   waitSeconds?: string;
+  pythMaxFeeUstx?: string;
 }
 
 interface RunOptions extends SharedOptions {
@@ -91,8 +92,9 @@ const DEFAULT_SLIPPAGE_BPS = 150;
 const DEFAULT_MAX_QUOTE_STALENESS_SECONDS = 30;
 const DEFAULT_MAX_PRICE_IMPACT_BPS = 500;
 const DEFAULT_MEMPOOL_DEPTH_LIMIT = 0;
-const PYTH_MAX_FEE_USTX = 10n;
+const DEFAULT_PYTH_MAX_FEE_USTX = 10n;
 const MAX_MASK = 18_446_744_073_709_551_615n;
+const sdkDiagnostics: string[] = [];
 
 const MARKET = "SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-4-market";
 const MARKET_VAULT = "SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-market-vault";
@@ -458,6 +460,7 @@ async function collectContext(opts: SharedOptions, requireAmount: boolean) {
   const slippageBps = parseBps(opts.slippageBps, DEFAULT_SLIPPAGE_BPS, "--slippage-bps");
   const maxPriceImpactBps = parseBps(opts.maxPriceImpactBps, DEFAULT_MAX_PRICE_IMPACT_BPS, "--max-price-impact-bps");
   const maxQuoteStalenessSeconds = parseNonNegativeInteger(opts.maxQuoteStalenessSeconds, DEFAULT_MAX_QUOTE_STALENESS_SECONDS, "--max-quote-staleness-seconds");
+  const pythMaxFee = parseNonNegativeBigInt(opts.pythMaxFeeUstx, DEFAULT_PYTH_MAX_FEE_USTX, "--pyth-max-fee-ustx");
   const [contracts, position, stxAvailable, pendingDepth, sbtcBalance, checkpoint] = await Promise.all([
     checkContracts(opts.wallet),
     getPosition(opts.wallet),
@@ -482,6 +485,7 @@ async function collectContext(opts: SharedOptions, requireAmount: boolean) {
     slippageBps,
     maxPriceImpactBps,
     maxQuoteStalenessSeconds,
+    pythMaxFee,
     contracts,
     position,
     mask: getMask(position),
@@ -513,6 +517,7 @@ function contextData(context: Awaited<ReturnType<typeof collectContext>>): JsonM
       slippageBps: context.slippageBps,
       maxPriceImpactBps: context.maxPriceImpactBps,
       maxQuoteStalenessSeconds: context.maxQuoteStalenessSeconds,
+      pythMaxFeeUstx: context.pythMaxFee,
     },
     safety: {
       pendingDepth: context.pendingDepth,
@@ -540,13 +545,13 @@ async function ensurePendingDepth(wallet: string, limit: number): Promise<number
   return pendingDepth;
 }
 
-async function buildBorrowTx(wallet: string, amount: bigint, privateKey: string, fee: bigint) {
+async function buildBorrowTx(wallet: string, amount: bigint, privateKey: string, fee: bigint, pythMaxFee: bigint) {
   const market = parseContractId(MARKET);
   const token = parseContractId(STX_TOKEN);
   const { bytes, feeds } = await fetchPythPriceFeedBytes([STX_PYTH_FEED, SBTC_PYTH_FEED]);
   const postConditions = [
     Pc.principal(STX_VAULT).willSendLte(amount).ustx(),
-    Pc.principal(wallet).willSendLte(PYTH_MAX_FEE_USTX).ustx(),
+    Pc.principal(wallet).willSendLte(pythMaxFee).ustx(),
   ];
   const tx = await makeContractCall({
     contractAddress: market.address,
@@ -592,9 +597,13 @@ async function withMutedConsole<T>(fn: () => Promise<T>): Promise<T> {
   const originalLog = console.log;
   const originalWarn = console.warn;
   const originalError = console.error;
-  console.log = () => undefined;
-  console.warn = () => undefined;
-  console.error = () => undefined;
+  const capture = (level: string, args: unknown[]) => {
+    sdkDiagnostics.push(`${level}: ${args.map((arg) => typeof arg === "string" ? arg : JSON.stringify(stringify(arg))).join(" ")}`);
+    if (sdkDiagnostics.length > 25) sdkDiagnostics.shift();
+  };
+  console.log = (...args: unknown[]) => capture("log", args);
+  console.warn = (...args: unknown[]) => capture("warn", args);
+  console.error = (...args: unknown[]) => capture("error", args);
   try {
     return await fn();
   } finally {
@@ -613,30 +622,37 @@ function atomicFromDecimal(amount: number, decimals: number): bigint {
 }
 
 async function prepareSwap(wallet: string, privateKey: string, amountUstx: bigint, slippageBps: number, maxPriceImpactBps: number, fee: bigint) {
+  sdkDiagnostics.length = 0;
   const sdk = await getBitflowSDK();
   const tokens = await withMutedConsole(() => sdk.getAvailableTokens());
   const stxToken = tokens.find((token: any) => (token.symbol ?? "").toLowerCase() === "stx" || (token.tokenId ?? "").toLowerCase() === "token-stx");
   const sbtcToken = tokens.find((token: any) => (token.symbol ?? "").toLowerCase() === "sbtc" || (token.tokenId ?? "").toLowerCase().includes("sbtc"));
-  if (!stxToken || !sbtcToken) throw new BlockedError("BITFLOW_TOKEN_NOT_FOUND", "Bitflow token list did not include STX and sBTC.", "Do not run until the Bitflow token surface is reachable.");
+  if (!stxToken || !sbtcToken) throw new BlockedError("BITFLOW_TOKEN_NOT_FOUND", "Bitflow token list did not include STX and sBTC.", "Do not run until the Bitflow token surface is reachable.", { sdkDiagnostics });
   const tokenInId = stxToken.tokenId ?? stxToken["token-id"];
   const tokenOutId = sbtcToken.tokenId ?? sbtcToken["token-id"];
   const tokenInDecimals = Number(stxToken.tokenDecimals ?? 6);
   const tokenOutDecimals = Number(sbtcToken.tokenDecimals ?? 8);
   const amountHuman = decimalFromAtomic(amountUstx, tokenInDecimals);
   const quotedAt = new Date().toISOString();
-  const quote = await withMutedConsole(() => sdk.getQuoteForRoute(tokenInId, tokenOutId, amountHuman));
-  if (!quote?.bestRoute?.route) throw new BlockedError("BITFLOW_NO_ROUTE", "Bitflow returned no STX -> sBTC route.", "Retry later or choose a different cycle size.");
+  const quote = await withMutedConsole(() => sdk.getQuoteForRoute(tokenInId, tokenOutId, amountHuman)).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new BlockedError("BITFLOW_QUOTE_ERROR", "Bitflow quote failed.", "Inspect Bitflow SDK diagnostics and retry later.", { message, sdkDiagnostics });
+  });
+  if (!quote?.bestRoute?.route) throw new BlockedError("BITFLOW_NO_ROUTE", "Bitflow returned no STX -> sBTC route.", "Retry later or choose a different cycle size.", { sdkDiagnostics });
   const priceImpactRaw = quote.bestRoute.priceImpact ?? null;
   const priceImpactBps = priceImpactRaw === null ? null : Math.round(Number(priceImpactRaw) * 100);
   if (priceImpactBps !== null && priceImpactBps > maxPriceImpactBps) {
-    throw new BlockedError("PRICE_IMPACT_TOO_HIGH", "Bitflow quote price impact exceeds the configured limit.", "Lower --borrow-amount-ustx or raise --max-price-impact-bps only after reviewing risk.", { priceImpactBps, maxPriceImpactBps });
+    throw new BlockedError("PRICE_IMPACT_TOO_HIGH", "Bitflow quote price impact exceeds the configured limit.", "Lower --borrow-amount-ustx or raise --max-price-impact-bps only after reviewing risk.", { priceImpactBps, maxPriceImpactBps, sdkDiagnostics });
   }
   const swapParams = await withMutedConsole(() => sdk.prepareSwap({
     route: quote.bestRoute.route,
     amount: amountHuman,
     tokenXDecimals: tokenInDecimals,
     tokenYDecimals: tokenOutDecimals,
-  }, wallet, slippageBps / 10_000));
+  }, wallet, slippageBps / 10_000)).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new BlockedError("BITFLOW_PREPARE_SWAP_ERROR", "Bitflow swap preparation failed.", "Inspect Bitflow SDK diagnostics and retry later.", { message, sdkDiagnostics });
+  });
   const tx = await makeContractCall({
     contractAddress: swapParams.contractAddress,
     contractName: swapParams.contractName,
@@ -663,6 +679,7 @@ async function prepareSwap(wallet: string, privateKey: string, amountUstx: bigin
     route: quote.bestRoute.route,
     swapCall: `${swapParams.contractAddress}.${swapParams.contractName}.${swapParams.functionName}`,
     postConditionCount: swapParams.postConditions?.length ?? 0,
+    sdkDiagnostics: [...sdkDiagnostics],
   };
 }
 
@@ -790,7 +807,7 @@ async function runCycle(opts: RunOptions): Promise<void> {
   };
   await writeCheckpoint(checkpoint);
 
-  const borrow = await buildBorrowTx(context.wallet, context.borrowAmount, signer.privateKey, fee);
+  const borrow = await buildBorrowTx(context.wallet, context.borrowAmount, signer.privateKey, fee, context.pythMaxFee);
   checkpoint.step = "borrow_broadcast";
   checkpoint.nextRequiredAction = "wait for borrow confirmation";
   await writeCheckpoint(checkpoint);
@@ -811,6 +828,9 @@ async function runCycle(opts: RunOptions): Promise<void> {
 
   await ensurePendingDepth(context.wallet, context.mempoolDepthLimit);
   const sbtcBeforeSwap = await getFtBalance(context.wallet, SBTC_TOKEN);
+  checkpoint.step = "swap_planned";
+  checkpoint.nextRequiredAction = "fetch fresh Bitflow quote and build swap";
+  await writeCheckpoint(checkpoint);
   const swap = await prepareSwap(context.wallet, signer.privateKey, context.borrowAmount, context.slippageBps, context.maxPriceImpactBps, fee);
   const quoteAgeSeconds = (Date.now() - new Date(swap.quotedAt).getTime()) / 1000;
   if (quoteAgeSeconds > context.maxQuoteStalenessSeconds) {
@@ -846,6 +866,9 @@ async function runCycle(opts: RunOptions): Promise<void> {
   await writeCheckpoint(checkpoint);
 
   await ensurePendingDepth(context.wallet, context.mempoolDepthLimit);
+  checkpoint.step = "resupply_planned";
+  checkpoint.nextRequiredAction = "build Zest resupply transaction";
+  await writeCheckpoint(checkpoint);
   const deposit = await buildDepositTx(context.wallet, receivedSbtc, signer.privateKey, fee);
   checkpoint.step = "resupply_broadcast";
   checkpoint.resuppliedSbtc = receivedSbtc.toString();
@@ -876,6 +899,9 @@ async function runCycle(opts: RunOptions): Promise<void> {
       swap: txProof(swapTxid, swapTx, "swap", swap.postConditionCount),
       resupply: txProof(resupplyTxid, resupplyTx, "supply-collateral-add", deposit.postConditionCount),
     },
+    diagnostics: {
+      bitflowSdk: swap.sdkDiagnostics,
+    },
     amounts: {
       borrowedUstx: context.borrowAmount,
       swapExpectedSbtcAtomic: swap.expectedAmountOutAtomic,
@@ -898,7 +924,12 @@ async function runResume(opts: RunOptions): Promise<void> {
     blocked("resume", "CONFIRMATION_REQUIRED", "Resuming a partial leverage cycle requires explicit confirmation.", "Re-run with --confirm=CYCLE after inspecting the checkpoint.", { checkpoint });
     return;
   }
-  if (checkpoint.step !== "borrow_confirmed" && checkpoint.step !== "swap_confirmed") {
+  if (
+    checkpoint.step !== "borrow_confirmed" &&
+    checkpoint.step !== "swap_planned" &&
+    checkpoint.step !== "swap_confirmed" &&
+    checkpoint.step !== "resupply_planned"
+  ) {
     blocked("resume", "UNSUPPORTED_RESUME_STEP", "This checkpoint step requires manual review before automatic resume.", "Inspect the checkpoint and transaction state before continuing.", { checkpoint });
     return;
   }
@@ -912,9 +943,12 @@ async function runResume(opts: RunOptions): Promise<void> {
   let swapPostConditionCount = 0;
   let swapExpectedSbtcAtomic = checkpoint.swapEstimatedSbtc ? BigInt(checkpoint.swapEstimatedSbtc) : 0n;
 
-  if (checkpoint.step === "borrow_confirmed") {
+  if (checkpoint.step === "borrow_confirmed" || checkpoint.step === "swap_planned") {
     await ensurePendingDepth(context.wallet, context.mempoolDepthLimit);
     const sbtcBeforeSwap = await getFtBalance(context.wallet, SBTC_TOKEN);
+    checkpoint.step = "swap_planned";
+    checkpoint.nextRequiredAction = "fetch fresh Bitflow quote and build swap";
+    await writeCheckpoint(checkpoint);
     const swap = await prepareSwap(context.wallet, signer.privateKey, context.borrowAmount, context.slippageBps, context.maxPriceImpactBps, fee);
     const quoteAgeSeconds = (Date.now() - new Date(swap.quotedAt).getTime()) / 1000;
     if (quoteAgeSeconds > context.maxQuoteStalenessSeconds) {
@@ -947,6 +981,9 @@ async function runResume(opts: RunOptions): Promise<void> {
   }
 
   await ensurePendingDepth(context.wallet, context.mempoolDepthLimit);
+  checkpoint.step = "resupply_planned";
+  checkpoint.nextRequiredAction = "build Zest resupply transaction";
+  await writeCheckpoint(checkpoint);
   const deposit = await buildDepositTx(context.wallet, receivedSbtc, signer.privateKey, fee);
   checkpoint.step = "resupply_broadcast";
   checkpoint.resuppliedSbtc = receivedSbtc.toString();
@@ -977,6 +1014,9 @@ async function runResume(opts: RunOptions): Promise<void> {
       borrow: checkpoint.borrowTxid ? txProof(checkpoint.borrowTxid, borrowTx, "borrow", 2) : null,
       swap: swapTxid ? txProof(swapTxid, swapTx, "swap", swapPostConditionCount) : null,
       resupply: txProof(resupplyTxid, resupplyTx, "supply-collateral-add", deposit.postConditionCount),
+    },
+    diagnostics: {
+      bitflowSdk: sdkDiagnostics,
     },
     amounts: {
       borrowedUstx: context.borrowAmount,
@@ -1009,6 +1049,7 @@ function addSharedOptions(command: Command): Command {
     .option("--max-quote-staleness-seconds <seconds>", "maximum Bitflow quote age before swap broadcast", String(DEFAULT_MAX_QUOTE_STALENESS_SECONDS))
     .option("--max-price-impact-bps <bps>", "maximum Bitflow quote price impact in basis points", String(DEFAULT_MAX_PRICE_IMPACT_BPS))
     .option("--min-gas-reserve-ustx <uSTX>", "minimum STX reserve before each write", DEFAULT_MIN_GAS_RESERVE_USTX.toString())
+    .option("--pyth-max-fee-ustx <uSTX>", "maximum STX the borrow leg may spend on Pyth oracle fees", DEFAULT_PYTH_MAX_FEE_USTX.toString())
     .option("--mempool-depth-limit <count>", "maximum pending sender tx count before each leg", String(DEFAULT_MEMPOOL_DEPTH_LIMIT))
     .option("--wait-seconds <seconds>", "seconds to poll Hiro for each transaction", String(DEFAULT_WAIT_SECONDS));
 }
