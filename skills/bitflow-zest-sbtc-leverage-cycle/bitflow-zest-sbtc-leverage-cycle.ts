@@ -443,8 +443,12 @@ async function checkContracts(wallet: string): Promise<JsonMap> {
     marketVault: MARKET_VAULT,
     borrowFunction: "borrow",
     resupplyFunction: "supply-collateral-add",
-    borrowPrimitive: "zest-borrow-asset-primitive",
-    depositPrimitive: "zest-asset-deposit-primitive",
+    implementationMode: "direct-controller",
+    intendedPrimitiveStack: [
+      "zest-borrow-asset-primitive",
+      "bitflow-swap-aggregator",
+      "zest-asset-deposit-primitive",
+    ],
     swapSurface: "BitflowSDK.prepareSwap",
   };
 }
@@ -786,7 +790,7 @@ async function runPlan(opts: SharedOptions): Promise<void> {
 
 async function runCycle(opts: RunOptions): Promise<void> {
   if (opts.confirm !== CONFIRM_TOKEN) {
-    blocked("run", "CONFIRMATION_REQUIRED", "This composed write skill requires explicit confirmation.", "Re-run with --confirm=CYCLE.", { requiredConfirm: CONFIRM_TOKEN });
+    blocked("run", "CONFIRMATION_REQUIRED", "This write skill requires explicit confirmation.", "Re-run with --confirm=CYCLE.", { requiredConfirm: CONFIRM_TOKEN });
     return;
   }
   const context = await collectContext(opts, true);

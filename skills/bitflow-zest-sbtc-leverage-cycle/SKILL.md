@@ -7,7 +7,7 @@ metadata:
   user-invocable: "false"
   arguments: "doctor | status | plan | run | resume | cancel"
   entry: "bitflow-zest-sbtc-leverage-cycle/bitflow-zest-sbtc-leverage-cycle.ts"
-  requires: "wallet, signing, settings, zest-borrow-asset-primitive, zest-asset-deposit-primitive, bitflow"
+  requires: "wallet, signing, settings, bitflow"
   tags: "defi, write, mainnet-only, requires-funds, infrastructure, l2"
 ---
 
@@ -28,9 +28,10 @@ stop on partial-cycle state instead of blindly starting a new cycle.
 ## Why agents need it
 
 Leveraged sBTC is not a single contract call. An agent needs confirmation,
-fresh quote handling, and saved progress across borrow, swap, and resupply. This
-skill provides that controller surface after the individual Zest borrow and
-Zest deposit primitives have been proven.
+fresh quote handling, and saved progress across borrow, swap, and resupply.
+This submitted version currently proves the contract sequence directly inside
+the controller. Final primitive-composition proof still requires reworking the
+cycle to orchestrate the standalone borrow, swap, and deposit primitive skills.
 
 ## Cycle steps
 
@@ -152,7 +153,7 @@ Blocked:
   "data": {},
   "error": {
     "code": "CONFIRMATION_REQUIRED",
-    "message": "This composed write skill requires explicit confirmation.",
+    "message": "This write skill requires explicit confirmation.",
     "next": "Re-run with --confirm=CYCLE."
   }
 }
@@ -161,8 +162,12 @@ Blocked:
 ## Known constraints
 
 - Requires existing Zest V2 sBTC collateral before running.
-- Uses the proven Zest V2 market borrow and supply-collateral-add paths.
+- Current implementation directly builds the Zest V2 market borrow and
+  supply-collateral-add calls.
 - Uses Bitflow SDK routing for STX to sBTC.
+- Final primitive-composition proof requires calling the standalone Zest borrow,
+  Bitflow swap, and Zest deposit primitive skill surfaces instead of recreating
+  their transaction logic here.
 - Does not repay, unwind, withdraw collateral, or manage HODLMM LP bins.
 - Does not claim HODLMM integration unless the produced Bitflow route proof
   demonstrates a HODLMM path.
