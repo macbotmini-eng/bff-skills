@@ -302,7 +302,7 @@ function aibtcPath(...parts: string[]): string {
 }
 
 function checkpointPath(wallet: string): string {
-  return aibtcPath("state", "sbtc-leverage-cycle-controller", `${wallet}.json`);
+  return aibtcPath("state", "bitflow-zest-sbtc-leverage-loop", `${wallet}.json`);
 }
 
 async function readCheckpoint(wallet: string): Promise<Checkpoint | null> {
@@ -449,7 +449,7 @@ async function checkContracts(wallet: string): Promise<JsonMap> {
 
 async function collectContext(opts: SharedOptions, requireAmount: boolean) {
   if (process.env.NETWORK && process.env.NETWORK !== "mainnet") {
-    throw new BlockedError("MAINNET_ONLY", "sbtc-leverage-cycle-controller is mainnet-only.", "Set NETWORK=mainnet.");
+    throw new BlockedError("MAINNET_ONLY", "bitflow-zest-sbtc-leverage-loop is mainnet-only.", "Set NETWORK=mainnet.");
   }
   if (!opts.wallet) throw new Error("--wallet is required");
   const borrowAmount = requireAmount ? parsePositiveBigInt(opts.borrowAmountUstx, "--borrow-amount-ustx") : (opts.borrowAmountUstx ? parsePositiveBigInt(opts.borrowAmountUstx, "--borrow-amount-ustx") : 0n);
@@ -1014,7 +1014,7 @@ function addSharedOptions(command: Command): Command {
 }
 
 const program = new Command();
-program.name("sbtc-leverage-cycle-controller").description("Execute one checkpointed Zest borrow -> Bitflow swap -> Zest resupply cycle.");
+program.name("bitflow-zest-sbtc-leverage-loop").description("Execute one full Bitflow + Zest sBTC leverage loop with resume safety.");
 
 addSharedOptions(program.command("doctor").description("Check dependency and wallet readiness"))
   .action((opts: SharedOptions) => runDoctor(opts).catch((error) => fail("doctor", error)));
