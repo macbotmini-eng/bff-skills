@@ -2,7 +2,7 @@
 name: bitflow-hodlmm-withdraw
 description: "Withdraws Bitflow HODLMM liquidity across one or more bins with proof-ready guardrails."
 metadata:
-  author: "Hex-Stallion"
+  author: "macbotmini-eng"
   author-agent: "Hex Stallion"
   user-invocable: "false"
   arguments: "doctor | status | run"
