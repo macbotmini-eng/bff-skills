@@ -13,6 +13,7 @@ import {
   noneCV,
   principalCV,
   uintCV,
+  type ClarityValue,
 } from "@stacks/transactions";
 import { STACKS_MAINNET } from "@stacks/network";
 import { getAddressFromPrivateKey } from "@stacks/transactions";
@@ -24,6 +25,7 @@ import * as path from "path";
 type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
 type JsonMap = { [key: string]: Json };
 type Status = "success" | "blocked" | "error";
+type CvJson = { success?: boolean; value?: unknown; type?: string };
 
 interface SharedOptions {
   wallet: string;
@@ -64,6 +66,7 @@ const CONFIRM_TOKEN = "DEPOSIT";
 const DEFAULT_FEE_USTX = 70_000n;
 const DEFAULT_MIN_GAS_RESERVE_USTX = 200_000n;
 const DEFAULT_WAIT_SECONDS = 240;
+const DEFAULT_READ_TIMEOUT_MS = 30_000;
 const MAX_MASK = 18_446_744_073_709_551_615n;
 
 const MARKET = "SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-4-market";
@@ -193,13 +196,46 @@ function resolveAsset(input: string | undefined): AssetConfig {
   return asset;
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const response = await fetch(url);
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(`HTTP ${response.status} from ${url}${body ? `: ${body.slice(0, 160)}` : ""}`);
+function readTimeoutMs(): number {
+  const raw = process.env.ZEST_READ_TIMEOUT_MS;
+  if (!raw) return DEFAULT_READ_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) throw new Error("ZEST_READ_TIMEOUT_MS must be a positive integer");
+  return parsed;
+}
+
+async function withTimeout<T>(label: string, operation: Promise<T>, timeoutMs = readTimeoutMs()): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`READ_TIMEOUT: ${label} exceeded ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
-  return response.json() as Promise<T>;
+}
+
+async function fetchJson<T>(url: string): Promise<T> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), readTimeoutMs());
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new Error(`HTTP ${response.status} from ${url}${body ? `: ${body.slice(0, 160)}` : ""}`);
+    }
+    return response.json() as Promise<T>;
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`READ_TIMEOUT: ${url} exceeded ${readTimeoutMs()}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function fetchContractInterface(contractId: string) {
@@ -209,29 +245,39 @@ async function fetchContractInterface(contractId: string) {
   );
 }
 
-async function callReadOnly(contractId: string, functionName: string, functionArgs: any[], sender: string): Promise<any> {
+async function callReadOnly(contractId: string, functionName: string, functionArgs: ClarityValue[], sender: string): Promise<CvJson> {
   const { address, name } = parseContractId(contractId);
-  const cv = await fetchCallReadOnlyFunction({
-    contractAddress: address,
-    contractName: name,
-    functionName,
-    functionArgs,
-    senderAddress: sender,
-    network: STACKS_MAINNET,
-  });
+  const cv = await withTimeout(
+    `${contractId}.${functionName}`,
+    fetchCallReadOnlyFunction({
+      contractAddress: address,
+      contractName: name,
+      functionName,
+      functionArgs,
+      senderAddress: sender,
+      network: STACKS_MAINNET,
+    })
+  );
   return cvToJSON(cv);
 }
 
-function cvUint(value: any): bigint {
-  if (value?.success === false) throw new Error(`Read-only call failed: ${JSON.stringify(value)}`);
-  const raw = value?.value?.value ?? value?.value;
+function asRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object") throw new Error(`Expected object, got ${JSON.stringify(value)}`);
+  return value as Record<string, unknown>;
+}
+
+function cvUint(value: unknown): bigint {
+  const record = asRecord(value);
+  if (record.success === false) throw new Error(`Read-only call failed: ${JSON.stringify(value)}`);
+  const nested = record.value && typeof record.value === "object" ? (record.value as Record<string, unknown>).value : undefined;
+  const raw = nested ?? record.value;
   if (typeof raw === "string") return BigInt(raw);
   if (typeof raw === "number") return BigInt(raw);
   throw new Error(`Expected uint CV JSON, got ${JSON.stringify(value)}`);
 }
 
-function cvOkUint(value: any): bigint {
-  if (!value?.success) throw new Error(`Read-only response failed: ${JSON.stringify(value)}`);
+function cvOkUint(value: CvJson): bigint {
+  if (!value.success) throw new Error(`Read-only response failed: ${JSON.stringify(value)}`);
   return cvUint(value.value);
 }
 
@@ -252,18 +298,17 @@ async function getFtBalance(wallet: string, asset: AssetConfig): Promise<bigint>
   return cvOkUint(await callReadOnly(asset.underlying, "get-balance", [principalCV(wallet)], wallet));
 }
 
-async function getPosition(wallet: string): Promise<{ exists: boolean; raw?: any; mask: bigint; debtCount: number; collateralCount: number }> {
-  try {
-    const result = await callReadOnly(MARKET_VAULT, "get-position", [principalCV(wallet), uintCV(MAX_MASK)], wallet);
-    if (!result?.success) return { exists: false, mask: 0n, debtCount: 0, collateralCount: 0, raw: result };
-    const value = result.value.value;
-    const mask = BigInt(value.mask.value);
-    const debtCount = value.debt.value.length;
-    const collateralCount = value.collateral.value.length;
-    return { exists: true, raw: result, mask, debtCount, collateralCount };
-  } catch {
-    return { exists: false, mask: 0n, debtCount: 0, collateralCount: 0 };
-  }
+async function getPosition(wallet: string): Promise<{ exists: boolean; raw?: unknown; mask: bigint; debtCount: number; collateralCount: number }> {
+  const result = await callReadOnly(MARKET_VAULT, "get-position", [principalCV(wallet), uintCV(MAX_MASK)], wallet);
+  if (!result.success) return { exists: false, mask: 0n, debtCount: 0, collateralCount: 0, raw: result };
+  const responseValue = asRecord(result.value);
+  const value = asRecord(responseValue.value);
+  const mask = BigInt(String(asRecord(value.mask).value));
+  const debtValue = asRecord(value.debt).value;
+  const collateralValue = asRecord(value.collateral).value;
+  const debtCount = Array.isArray(debtValue) ? debtValue.length : 0;
+  const collateralCount = Array.isArray(collateralValue) ? collateralValue.length : 0;
+  return { exists: true, raw: result, mask, debtCount, collateralCount };
 }
 
 async function validateEgroup(wallet: string, asset: AssetConfig, position: Awaited<ReturnType<typeof getPosition>>): Promise<JsonMap> {
@@ -578,6 +623,38 @@ async function runStatus(opts: SharedOptions): Promise<void> {
   success("status", contextData(context));
 }
 
+async function runPlan(opts: SharedOptions): Promise<void> {
+  const context = await collectContext(opts, true);
+  if (!context.balanceOk) {
+    throw new BlockedError("INSUFFICIENT_ASSET_BALANCE", "Wallet balance is too low for the requested deposit.", "Reduce --amount or fund the wallet.", { balance: context.balance, amount: context.amount });
+  }
+  if (!context.gasOk) {
+    throw new BlockedError("INSUFFICIENT_STX_BALANCE", "STX balance is too low for fee and reserve.", "Fund the wallet with more STX or lower --min-gas-reserve-ustx.", { balance: context.stxBalance, required: context.stxRequired });
+  }
+  success("plan", {
+    ...contextData(context),
+    transaction: {
+      contract: MARKET,
+      function: "supply-collateral-add",
+      arguments: [
+        { name: "ft", value: context.asset.underlying },
+        { name: "amount", value: context.amount },
+        { name: "min-shares", value: context.minShares },
+        { name: "price-feeds", value: "none" },
+      ],
+      postConditionMode: "deny",
+      postConditionCount: buildPostConditions(context).length,
+    },
+    proofObligations: [
+      "Hiro tx_status must be success",
+      "sender must match --wallet",
+      "contract/function must be v0-4-market.supply-collateral-add",
+      "post_condition_mode must be deny",
+      "post-deposit position should reflect the collateral top-up",
+    ],
+  });
+}
+
 async function runConfirmed(opts: RunOptions): Promise<void> {
   if (opts.confirm !== CONFIRM_TOKEN) {
     blocked("run", "CONFIRMATION_REQUIRED", "This write skill requires explicit confirmation.", "Re-run with --confirm=DEPOSIT.", { requiredConfirm: CONFIRM_TOKEN });
@@ -629,6 +706,15 @@ addSharedOptions(program.command("status").description("Preview Zest deposit wit
       await runStatus(opts);
     } catch (error) {
       fail("status", error);
+    }
+  });
+
+addSharedOptions(program.command("plan").description("Prepare the Zest deposit transaction plan without broadcasting"))
+  .action(async (opts: SharedOptions) => {
+    try {
+      await runPlan(opts);
+    } catch (error) {
+      fail("plan", error);
     }
   });
 

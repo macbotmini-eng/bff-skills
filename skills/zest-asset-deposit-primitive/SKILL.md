@@ -5,7 +5,7 @@ metadata:
   author: "macbotmini-eng"
   author-agent: "Hex Stallion"
   user-invocable: "false"
-  arguments: "doctor | status | run"
+  arguments: "doctor | status | plan | run"
   entry: "zest-asset-deposit-primitive/zest-asset-deposit-primitive.ts"
   requires: "wallet, signing, settings"
   tags: "defi, write, mainnet-only, requires-funds, infrastructure, l2"
@@ -31,7 +31,7 @@ Agents need a standalone collateral-entry primitive before they can safely compo
 - The skill verifies the Zest V2 market, selected asset, paired vault, current wallet balance, share conversion, pending transaction depth, signer address, and postcondition plan before broadcast.
 - Transactions use `PostConditionMode.Deny`.
 - FT deposits include postconditions for wallet underlying spend, Market underlying spend, and wallet vault-share movement.
-- STX deposits account for the wrapper's native STX transfer behavior.
+- STX deposits use the wrapper's native STX transfer behavior, but the current public proof covers only sBTC.
 - The skill blocks if a nonzero deposit converts to zero vault shares.
 - The skill blocks unsupported live egroup masks before broadcast.
 - It is not a borrow, repay, withdraw, faucet, swap, leverage loop, or HODLMM skill.
@@ -48,6 +48,12 @@ bun run skills/zest-asset-deposit-primitive/zest-asset-deposit-primitive.ts doct
 
 ```bash
 bun run skills/zest-asset-deposit-primitive/zest-asset-deposit-primitive.ts status --wallet <stacks-address> --deposit-asset sBTC --amount <base-units>
+```
+
+### plan
+
+```bash
+bun run skills/zest-asset-deposit-primitive/zest-asset-deposit-primitive.ts plan --wallet <stacks-address> --deposit-asset sBTC --amount <base-units>
 ```
 
 ### run
@@ -86,5 +92,7 @@ Blocked:
 ## Known constraints
 
 - The initial proof path uses sBTC because the proof wallet already has a Zest sBTC collateral position and that live egroup admits same-collateral top-ups.
+- Supported assets in this version are limited to `STX`, `sBTC`, and `USDC` / `USDCx`. Other live Zest V2 assets such as `stSTX`, `USDH`, and `stSTXbtc` are not implemented yet and will return an unsupported-asset error.
+- STX deposit support is implemented from the live wrapper path but is not yet covered by a mainnet proof transaction in this PR.
 - Adding a different collateral class to an existing Zest account can be blocked by the live egroup registry. The skill checks this and blocks before broadcast.
 - `price-feeds` are currently passed as `none`; same-collateral top-ups and no-debt collateral adds do not need a fresh oracle write in the verified proof path.
