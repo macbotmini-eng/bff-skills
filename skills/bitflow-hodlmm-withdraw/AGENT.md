@@ -1,7 +1,7 @@
 ---
 name: bitflow-hodlmm-withdraw-agent
 skill: bitflow-hodlmm-withdraw
-description: "Withdraws Bitflow HODLMM bin liquidity only after live checks pass."
+description: "Agent powered Withdrawls from Bitflow's HOLDMM. Remove Liquidity."
 ---
 
 # Agent Behavior - Bitflow HODLMM Withdraw
