@@ -1071,7 +1071,6 @@ async function buildAndBroadcast(context: Context, privateKey: string, fee: bigi
 
   return {
     txid: normalizeTxId(result.txid),
-    rawTx: transaction.serialize(),
     postConditionCount: postConditions.length,
   };
 }
@@ -1129,12 +1128,18 @@ function txProofData(context: Context, signer: { source: string; address: string
 async function runDoctor(opts: SharedOptions): Promise<void> {
   try {
     const context = await collectContext(opts);
-    const signerAvailable = Boolean(process.env.STACKS_PRIVATE_KEY || process.env.AIBTC_WALLET_PASSWORD);
+    const signerSource = process.env.CLIENT_MNEMONIC
+      ? "CLIENT_MNEMONIC"
+      : process.env.STACKS_PRIVATE_KEY
+        ? "STACKS_PRIVATE_KEY"
+        : process.env.AIBTC_WALLET_PASSWORD
+          ? "AIBTC_WALLET_PASSWORD"
+          : null;
     const data = contextData(context);
     data.signer = {
-      availableForRun: signerAvailable,
-      source: process.env.STACKS_PRIVATE_KEY ? "STACKS_PRIVATE_KEY" : process.env.AIBTC_WALLET_PASSWORD ? "AIBTC_WALLET_PASSWORD" : null,
-      note: signerAvailable ? "Signer env is present for confirmed run" : "Signer env not set; doctor/status are still read-only",
+      availableForRun: Boolean(signerSource),
+      source: signerSource,
+      note: signerSource ? "Signer env is present for confirmed run" : "Signer env not set; doctor/status are still read-only",
     };
 
     if (context.pendingDepth > 0) {
