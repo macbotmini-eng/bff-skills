@@ -160,7 +160,7 @@ const COMPOSITION_GOALS = [
     goal: "#559 — HODLMM-Zest yield router composition layer",
     track: "#471",
     role: "Composed yield router over accepted HODLMM entry/exit primitives",
-    status: "pending implementation after primitive acceptance",
+    status: "primitive acceptance cleared; implementation can start; upstream promotion still tracked separately",
   },
   {
     goal: "#562 — sbtc-leverage-unwind-planner",
@@ -301,12 +301,38 @@ async function loadGraph(opts: CliOptions): Promise<GraphData> {
         author { login }
         closingIssuesReferences(first:20) { nodes { id number title state url } }
       }
+      pr356: pullRequest(number:356) {
+        number
+        title
+        state
+        isDraft
+        reviewDecision
+        url
+        body
+        author { login }
+        closingIssuesReferences(first:20) { nodes { id number title state url } }
+      }
+      pr357: pullRequest(number:357) {
+        number
+        title
+        state
+        isDraft
+        reviewDecision
+        url
+        body
+        author { login }
+        closingIssuesReferences(first:20) { nodes { id number title state url } }
+      }
     }
   }`;
 
   const data = await githubGraphql<{
     repository: Record<string, IssueNode | PullRequestNode | null>;
-    aibtcdevSkills: { pr340: PullRequestNode | null } | null;
+    aibtcdevSkills: {
+      pr340: PullRequestNode | null;
+      pr356: PullRequestNode | null;
+      pr357: PullRequestNode | null;
+    } | null;
   }>(opts, query, {
     owner: opts.owner,
     repo: opts.repo,
@@ -324,6 +350,8 @@ async function loadGraph(opts: CliOptions): Promise<GraphData> {
     if (pr) prs[String(n)] = pr;
   }
   if (data.aibtcdevSkills?.pr340) externalPrs["aibtcdev/skills#340"] = data.aibtcdevSkills.pr340;
+  if (data.aibtcdevSkills?.pr356) externalPrs["aibtcdev/skills#356"] = data.aibtcdevSkills.pr356;
+  if (data.aibtcdevSkills?.pr357) externalPrs["aibtcdev/skills#357"] = data.aibtcdevSkills.pr357;
 
   return { issues, prs, externalPrs };
 }
@@ -444,6 +472,24 @@ function classifyDrift(graph: GraphData): DriftFinding[] {
     });
   }
 
+  const upstream356 = graph.externalPrs["aibtcdev/skills#356"];
+  if (upstream356?.state === "OPEN") {
+    findings.push({
+      severity: "info",
+      code: "UPSTREAM_356_OPEN",
+      message: "#551 is merged in BFF and can be composed by #559; aibtcdev/skills#356 remains an open registry-promotion follow-up, not a #559 build blocker.",
+    });
+  }
+
+  const upstream357 = graph.externalPrs["aibtcdev/skills#357"];
+  if (upstream357?.state === "OPEN") {
+    findings.push({
+      severity: "info",
+      code: "UPSTREAM_357_OPEN",
+      message: "#556 is merged in BFF and can be composed by #559; aibtcdev/skills#357 remains an open registry-promotion follow-up, not a #559 build blocker.",
+    });
+  }
+
   findings.push({
     severity: "info",
     code: "UNWIND_NOT_IMPLEMENTED",
@@ -479,6 +525,9 @@ function timelineSignal(comment: CommentNode): string {
   if (body.includes("MacBotMini primitive dependency graph")) {
     return "Manual graph snapshot. This generated report should replace manual graph maintenance once the workflow lands.";
   }
+  if (body.includes("#551 and #556 are merged") && body.includes("accepted infrastructure")) {
+    return "#471 status transition: #551 bitflow-hodlmm-withdraw and #556 bitflow-hodlmm-deposit are merged/accepted in BFF, so #559 Bitflow HODLMM-Zest yield loop can start implementation against them directly. The same note clarifies that the borrow-helper warning does not apply to #572, which uses the active Zest V2 Market borrow path.";
+  }
   return "Timeline note that should be reviewed manually if it starts affecting graph structure.";
 }
 
@@ -499,6 +548,9 @@ function timelineRows(issue: IssueNode | undefined): string {
 function bodySpecificTimelineTitle(body: string, fallback: string): string {
   if (body.includes("latest #473 dependency correction")) {
     return "Follow: Leveraged sBTC via Zest + Bitflow (#473) now uses #566 zest-borrow-asset-primitive PRD and #572 implementation PR";
+  }
+  if (body.includes("#551 and #556 are merged") && body.includes("accepted infrastructure")) {
+    return "Updated read from @arc0btc: #551/#556 accepted; #559 can start; #572 V2 Market path confirmed";
   }
   return fallback;
 }
@@ -521,6 +573,8 @@ function renderReport(graph: GraphData, findings: DriftFinding[]): string {
   const i = graph.issues;
   const p = graph.prs;
   const upstream340 = graph.externalPrs["aibtcdev/skills#340"];
+  const upstream356 = graph.externalPrs["aibtcdev/skills#356"];
+  const upstream357 = graph.externalPrs["aibtcdev/skills#357"];
 
   const blockers = findings.filter((finding) => finding.severity !== "info");
   const followUps = findings.filter((finding) => finding.severity === "info");
@@ -640,6 +694,8 @@ ${implementationRows}
 | Item | Role | Current status |
 |---|---|---|
 | [aibtcdev/skills#340](${upstream340?.url || "https://github.com/aibtcdev/skills/pull/340"}) — ${escapeTableCell(upstream340?.title || "sbtc-yield-maximizer HODLMM leg")} | Upstream #471 HODLMM routing continuation | ${prStatus(upstream340)} |
+| [aibtcdev/skills#356](${upstream356?.url || "https://github.com/aibtcdev/skills/pull/356"}) — ${escapeTableCell(upstream356?.title || "bitflow-hodlmm-withdraw registry promotion")} | Registry-promotion PR for merged BFF #551 withdraw primitive | ${prStatus(upstream356)} |
+| [aibtcdev/skills#357](${upstream357?.url || "https://github.com/aibtcdev/skills/pull/357"}) — ${escapeTableCell(upstream357?.title || "bitflow-hodlmm-deposit registry promotion")} | Registry-promotion PR for merged BFF #556 deposit primitive | ${prStatus(upstream357)} |
 
 ### Timeline Signals From #558
 
@@ -677,10 +733,11 @@ ${followUpText}
 
 ### Next Work
 
-1. Keep #566/#572 as the active Zest borrow primitive path.
-2. Finish review/acceptance on #572, #574, and #577 before treating #578 as ready.
-3. Build #562 as the unwind/close-position safety layer before calling #473 a full loop.
-4. Keep #558 as the protected evaluation snapshot; update this managed comment for current status.
+1. Start #559 implementation now that #551 and #556 are merged in BFF; track aibtcdev/skills#356/#357 as registry-promotion follow-ups.
+2. Keep #566/#572 as the active Zest borrow primitive path.
+3. Finish review/acceptance on #572, #574, and #577 before treating #578 as ready.
+4. Build #562 as the unwind/close-position safety layer before calling #473 a full loop.
+5. Keep #558 as the protected evaluation snapshot; update this managed comment for current status.
 `;
 }
 
