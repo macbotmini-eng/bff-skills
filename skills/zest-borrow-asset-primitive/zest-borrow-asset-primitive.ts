@@ -46,6 +46,7 @@ interface AssetConfig {
   symbol: string;
   aliases: string[];
   underlying: string;
+  assetName: string;
   vault?: string;
   decimals: number;
   canCollateral: boolean;
@@ -68,6 +69,7 @@ const DEFAULT_FEE_USTX = 70_000n;
 const DEFAULT_MIN_GAS_RESERVE_USTX = 200_000n;
 const DEFAULT_WAIT_SECONDS = 240;
 const PYTH_MAX_FEE_USTX = 10n;
+const INDEX_PRECISION = 1_000_000_000_000n;
 
 const MARKET = "SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-4-market";
 const MARKET_VAULT = "SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-market-vault";
@@ -80,6 +82,7 @@ const ASSET_CONFIGS: AssetConfig[] = [
     symbol: "STX",
     aliases: ["stx", "wstx"],
     underlying: "SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.wstx",
+    assetName: "wstx",
     vault: STX_VAULT,
     decimals: 6,
     canCollateral: true,
@@ -90,6 +93,7 @@ const ASSET_CONFIGS: AssetConfig[] = [
     symbol: "sBTC",
     aliases: ["sbtc", "btc"],
     underlying: "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token",
+    assetName: "sbtc-token",
     vault: "SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-vault-sbtc",
     decimals: 8,
     canCollateral: true,
@@ -100,6 +104,7 @@ const ASSET_CONFIGS: AssetConfig[] = [
     symbol: "stSTX",
     aliases: ["ststx"],
     underlying: "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.ststx-token",
+    assetName: "ststx",
     vault: "SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-vault-ststx",
     decimals: 6,
     canCollateral: true,
@@ -110,6 +115,7 @@ const ASSET_CONFIGS: AssetConfig[] = [
     symbol: "USDC",
     aliases: ["usdc", "usdcx"],
     underlying: "SP120SBRBQJ00MCWS7TM5R8WJNTTKD5K0HFRC2CNE.usdcx",
+    assetName: "usdcx-token",
     vault: "SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-vault-usdc",
     decimals: 6,
     canCollateral: true,
@@ -120,6 +126,7 @@ const ASSET_CONFIGS: AssetConfig[] = [
     symbol: "USDH",
     aliases: ["usdh"],
     underlying: "SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG.usdh-token-v1",
+    assetName: "usdh",
     vault: "SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-vault-usdh",
     decimals: 8,
     canCollateral: true,
@@ -129,6 +136,7 @@ const ASSET_CONFIGS: AssetConfig[] = [
     symbol: "stSTXBTC",
     aliases: ["ststxbtc"],
     underlying: "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.ststxbtc-token-v2",
+    assetName: "ststxbtc",
     vault: "SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-vault-ststxbtc",
     decimals: 6,
     canCollateral: true,
@@ -255,6 +263,15 @@ function uintValue(value: unknown): bigint {
   return BigInt(String(value ?? "0"));
 }
 
+function fieldValue(value: unknown): unknown {
+  if (value && typeof value === "object" && "value" in value) return (value as { value: unknown }).value;
+  return value;
+}
+
+function boolField(value: JsonMap | null, field: string): boolean {
+  return Boolean(fieldValue(value?.[field]));
+}
+
 function okValue(value: JsonMap): unknown {
   if (value.success === false) return null;
   const wrapped = value.value;
@@ -271,6 +288,37 @@ function parseListEntries(value: unknown): JsonMap[] {
     ? (first as { value: unknown }).value
     : first;
   return Array.isArray(list) ? list.map((entry) => (entry && typeof entry === "object" && "value" in entry ? (entry as { value: JsonMap }).value : entry as JsonMap)) : [];
+}
+
+function oracleSummary(status: JsonMap): JsonMap {
+  const value = okValue(status) as JsonMap | null;
+  const oracle = fieldValue(value?.oracle) as JsonMap | null;
+  const callcode = fieldValue(oracle?.callcode) as JsonMap | null;
+  return {
+    type: fieldValue(oracle?.type) as Json,
+    ident: fieldValue(oracle?.ident) as Json,
+    callcode: callcode ? fieldValue(callcode) as Json : null,
+    maxStaleness: fieldValue(oracle?.["max-staleness"]) as Json,
+  };
+}
+
+function registrySummary(status: JsonMap): JsonMap {
+  const value = okValue(status) as JsonMap | null;
+  return {
+    collateralEnabled: boolField(value, "collateral"),
+    borrowEnabled: boolField(value, "debt"),
+    oracle: oracleSummary(status),
+  };
+}
+
+function okUint(value: JsonMap | undefined): bigint | null {
+  if (!value) return null;
+  const inner = okValue(value);
+  return inner === null || inner === undefined ? null : uintValue(inner);
+}
+
+function scaledToDebt(scaledDebt: bigint, index: bigint | null): bigint | null {
+  return index === null ? null : (scaledDebt * index) / INDEX_PRECISION;
 }
 
 async function getAssetStatus(asset: AssetConfig, wallet: string, useVault: boolean): Promise<JsonMap> {
@@ -300,13 +348,17 @@ async function getBorrowVaultStats(asset: AssetConfig, wallet: string): Promise<
     callReadOnly(asset.vault, "get-pause-states", [], wallet).then(cvJson),
     callReadOnly(asset.vault, "get-cap-debt", [], wallet).then(cvJson).catch(() => ({})),
     callReadOnly(asset.vault, "get-debt", [], wallet).then(cvJson).catch(() => ({})),
+    callReadOnly(asset.vault, "get-index", [], wallet).then(cvJson).catch(() => ({})),
+    callReadOnly(asset.vault, "get-next-index", [], wallet).then(cvJson).catch(() => ({})),
     callReadOnly(asset.vault, "get-available-assets", [], wallet).then(cvJson).catch(() => ({})),
   ]);
   return {
     pauseStates: calls[0],
     capDebt: calls[1],
     debt: calls[2],
-    availableAssets: calls[3],
+    index: calls[3],
+    nextIndex: calls[4],
+    availableAssets: calls[5],
   };
 }
 
@@ -379,8 +431,16 @@ async function collectContext(opts: SharedOptions, requireAmount: boolean, requi
 
   const collateralAssetId = assetIdFromStatus(collateralStatus);
   const borrowAssetId = assetIdFromStatus(borrowStatus);
+  const collateralRegistry = registrySummary(collateralStatus);
+  const borrowRegistry = registrySummary(borrowStatus);
+  if (!collateralRegistry.collateralEnabled) throw new BlockedError("COLLATERAL_NOT_ENABLED", `${collateralAsset.symbol} is not enabled as Zest V2 collateral in the live registry.`, "Choose an enabled collateral asset or re-verify the registry.", { collateralAsset: collateralAsset.symbol, collateralRegistry });
+  if (!borrowRegistry.borrowEnabled) throw new BlockedError("BORROW_NOT_ENABLED", `${borrowAsset.symbol} is not enabled as a Zest V2 borrow asset in the live registry.`, "Choose an enabled borrow asset or re-verify the registry.", { borrowAsset: borrowAsset.symbol, borrowRegistry });
   const collateralAmount = findPositionAmount(position, "collateral", collateralAssetId);
   const scaledDebt = findPositionAmount(position, "debt", borrowAssetId);
+  const debtIndex = okUint(borrowVaultStats.index as JsonMap | undefined);
+  const nextDebtIndex = okUint(borrowVaultStats.nextIndex as JsonMap | undefined);
+  const currentDebtEstimate = scaledToDebt(scaledDebt, debtIndex);
+  const nextDebtEstimate = scaledToDebt(scaledDebt, nextDebtIndex);
   const positionTracked = position.success !== false;
 
   if (requireAmount) {
@@ -409,8 +469,21 @@ async function collectContext(opts: SharedOptions, requireAmount: boolean, requi
       legacyHelperNotTarget: "SP2VCQJGH7PHP2DJK7Z0V48AGBHQAW3R3ZW1QF4N.borrow-helper-v2-1-7",
     },
     assets: {
-      collateral: { symbol: collateralAsset.symbol, vault: collateralAsset.vault, assetId: collateralAssetId, amount: collateralAmount, decimals: collateralAsset.decimals },
-      borrow: { symbol: borrowAsset.symbol, token: borrowAsset.underlying, assetId: borrowAssetId, scaledDebt, decimals: borrowAsset.decimals },
+      collateral: { symbol: collateralAsset.symbol, vault: collateralAsset.vault, assetId: collateralAssetId, amount: collateralAmount, decimals: collateralAsset.decimals, registry: collateralRegistry },
+      borrow: {
+        symbol: borrowAsset.symbol,
+        token: borrowAsset.underlying,
+        assetName: borrowAsset.assetName,
+        assetId: borrowAssetId,
+        scaledDebt,
+        currentDebtEstimate,
+        nextDebtEstimate,
+        debtIndex,
+        nextDebtIndex,
+        scaledDebtNote: "scaledDebt is principal in index-scaled units. It is not the repayment amount; multiply by the debt index / 1e12 for an estimated current debt amount.",
+        decimals: borrowAsset.decimals,
+        registry: borrowRegistry,
+      },
     },
     safety: {
       network: NETWORK,
@@ -486,9 +559,8 @@ function buildPostConditions(context: Awaited<ReturnType<typeof collectContext>>
       Pc.principal(context.wallet).willSendLte(PYTH_MAX_FEE_USTX).ustx(),
     ];
   }
-  const assetName = parseContractId(context.borrowAsset.underlying).name;
   return [
-    Pc.principal(context.borrowAsset.vault as `${string}.${string}`).willSendLte(context.amount).ft(context.borrowAsset.underlying as `${string}.${string}`, assetName),
+    Pc.principal(context.borrowAsset.vault as `${string}.${string}`).willSendLte(context.amount).ft(context.borrowAsset.underlying as `${string}.${string}`, context.borrowAsset.assetName),
     Pc.principal(context.wallet).willSendLte(PYTH_MAX_FEE_USTX).ustx(),
   ];
 }
@@ -546,6 +618,16 @@ async function waitForTx(txid: string, waitSeconds: number): Promise<JsonMap | n
 
 async function runDoctor(opts: SharedOptions): Promise<void> {
   const context = await collectContext({ ...opts, collateralAsset: opts.collateralAsset ?? "sBTC", borrowAsset: opts.borrowAsset ?? "STX" }, false, false);
+  if (context.pendingDepth > 0) {
+    blocked("doctor", "PENDING_STX_TX", `Wallet has ${context.pendingDepth} pending transaction(s).`, "Wait for pending transactions to confirm before planning or borrowing.", {
+      result: "blocked-by-pending-tx",
+      pendingDepth: context.pendingDepth,
+      contracts: context.contracts,
+      assets: context.assets,
+      safety: context.safety,
+    });
+    return;
+  }
   success("doctor", {
     result: context.pendingDepth === 0 ? "ready" : "blocked-by-pending-tx",
     contracts: context.contracts,

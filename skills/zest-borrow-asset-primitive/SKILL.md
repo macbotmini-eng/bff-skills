@@ -31,6 +31,7 @@ Leveraged sBTC workflows need a proven borrow leg before any controller can safe
 - It verifies the configured Zest V2 market, vault, assets, and egroup contracts before a write.
 - It reads selected asset, LP token, oracle, reserve, collateral, debt, gas, and pending transaction state before planning or running.
 - It uses `PostConditionMode.Deny` with an asset transfer postcondition for the borrowed asset where expressible.
+- For non-STX borrowed assets, the postcondition uses the SIP-010 asset name, not the contract name.
 - It calls `v0-4-market.borrow` directly; legacy helper contracts are not the submission target.
 - It treats `borrow-helper-v2-1-7` and `borrow-helper-v2-1-5` as legacy/non-target paths for this V2 primitive.
 - It blocks when the sender has pending STX transactions.
@@ -125,4 +126,6 @@ Error:
 - The verified V2 borrow target is `SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-4-market.borrow`.
 - The V2 borrow ABI is positional: `ft`, `amount`, `receiver`, `price-feeds`; `receiver` must be an optional principal such as `(some --wallet)`.
 - Zest's exact global health calculation is enforced inside the V2 market borrow path. The skill reads public Zest state and refuses obvious unsafe setups, but PR proof must include successful on-chain execution and post-borrow status showing updated debt before any leverage controller can depend on it.
+- `scaledDebt` is index-scaled principal, not the exact repayment amount. Status output includes debt-index fields and estimated current debt when the borrow vault exposes them.
+- Some Zest V2 assets intentionally share a base oracle feed and apply a Market callcode transform. Status output includes the live registry oracle tuple so downstream controllers can see the feed id and callcode used by the selected collateral and borrow assets.
 - Single-borrow nonce safety is in scope: the skill blocks when the sender already has pending STX transactions. Standalone/cross-skill nonce serialization belongs in the existing nonce runtime primitives and later composed controllers.

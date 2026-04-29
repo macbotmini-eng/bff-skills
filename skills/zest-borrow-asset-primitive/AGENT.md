@@ -10,11 +10,12 @@ description: "Borrows from Zest only after live collateral, gas, pending transac
 
 1. Run `doctor` first. If it fails, stop and surface the blocker.
 2. Run `status` to inspect current collateral and debt.
-3. Convert the requested borrow size to base units for the selected borrow asset.
-4. Run `plan` with the requested borrow amount.
-5. Confirm debt-creating intent before any write.
-6. Execute `run --confirm=BORROW` only after the latest plan still looks safe.
-7. Verify the returned tx through Hiro before treating the borrow as proof.
+3. Treat `scaledDebt` as index-scaled principal, not the repayment amount. Use the reported debt-index estimate for planning and let Zest enforce final health on-chain.
+4. Convert the requested borrow size to base units for the selected borrow asset.
+5. Run `plan` with the requested borrow amount.
+6. Confirm debt-creating intent before any write.
+7. Execute `run --confirm=BORROW` only after the latest plan still looks safe.
+8. Verify the returned tx through Hiro before treating the borrow as proof.
 
 ## Guardrails
 
