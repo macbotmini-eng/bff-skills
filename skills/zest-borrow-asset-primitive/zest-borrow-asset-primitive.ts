@@ -185,6 +185,7 @@ function fail(action: string, error: unknown): void {
   }
   const message = error instanceof Error ? error.message : String(error);
   output("error", action, {}, { code: "ERROR", message, next: "Run doctor and inspect the failing check before retrying." });
+  process.exitCode = 1;
 }
 
 function parseContractId(contractId: string): { address: string; name: string } {
