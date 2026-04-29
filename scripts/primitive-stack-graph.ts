@@ -81,6 +81,7 @@ interface DriftFinding {
 
 const MARKER = "<!-- primitive-stack-graph-report -->";
 const PROTECTED_OVERVIEW_BODY_SHA256 = "124713205d4c8b53270763fb02cae3ce94ecbb8629833b4361ef333a28ae36b6";
+const MACBOTMINI_MARK = "🍔";
 
 const ISSUE_NUMBERS = [558, 471, 473, 550, 553, 559, 560, 561, 562, 566, 570, 573, 576];
 const PR_NUMBERS = [348, 495, 551, 556, 569, 571, 572, 574, 575, 577, 578];
@@ -473,7 +474,7 @@ function timelineSignal(comment: CommentNode): string {
     return "Reviewer context: #551/#556 dependency posture and the old Zest helper warning. The helper warning is now superseded for active borrow by the later #566/#572 V2 Market correction, but the dependency discipline still matters.";
   }
   if (body.includes("latest #473 dependency correction")) {
-    return "Active #473 borrow correction: #566/#572 are the current Zest V2 Market borrow path; #570 and helper-era borrow-helper/pool-borrow paths are stale.";
+    return "Active #473 Leveraged sBTC via Zest + Bitflow correction: #566 zest-borrow-asset-primitive PRD and #572 zest-borrow-asset-primitive implementation PR are the current Zest V2 Market borrow path; #570 and helper-era borrow-helper/pool-borrow paths are stale.";
   }
   if (body.includes("MacBotMini primitive dependency graph")) {
     return "Manual graph snapshot. This generated report should replace manual graph maintenance once the workflow lands.";
@@ -484,14 +485,22 @@ function timelineSignal(comment: CommentNode): string {
 function timelineRows(issue: IssueNode | undefined): string {
   if (!issue) return "| missing | missing | missing |\n";
   const rows = issue.comments.nodes.map((comment) => {
-    const firstHeading =
+    const rawHeading =
       comment.body
         .split("\n")
         .find((line) => line.startsWith("## "))
         ?.replace(/^##\s+/, "") || `Comment ${comment.databaseId}`;
+    const firstHeading = bodySpecificTimelineTitle(comment.body, rawHeading);
     return `| [${comment.databaseId}](${comment.url}) | ${escapeTableCell(firstHeading)} | ${escapeTableCell(timelineSignal(comment))} |`;
   });
   return rows.length ? rows.join("\n") : "| none | none | none |";
+}
+
+function bodySpecificTimelineTitle(body: string, fallback: string): string {
+  if (body.includes("latest #473 dependency correction")) {
+    return "Follow: Leveraged sBTC via Zest + Bitflow (#473) now uses #566 zest-borrow-asset-primitive PRD and #572 implementation PR";
+  }
+  return fallback;
 }
 
 function issueStatus(issue: IssueNode | undefined): string {
@@ -527,7 +536,7 @@ function renderReport(graph: GraphData, findings: DriftFinding[]): string {
   const implementationRows = ACTIVE_IMPLEMENTATIONS.map((entry) => {
     const issue = i[String(entry.prd)];
     const pr = p[String(entry.pr)];
-    return `| #${entry.prd} — ${issue?.title || "missing"} | ${entry.role} | #${entry.pr} — ${pr?.title || "missing"} | ${entry.track} | ${issueStatus(issue)} | ${prStatus(pr)} | ${entry.proof} |`;
+    return `| #${entry.prd} — ${issue?.title || "missing"} | ${entry.role} | ${MACBOTMINI_MARK} #${entry.pr} — ${pr?.title || "missing"} | ${entry.track} | ${issueStatus(issue)} | ${prStatus(pr)} | ${entry.proof} |`;
   }).join("\n");
   const implementationClassLines = ACTIVE_IMPLEMENTATIONS.map((entry) => {
     const pr = p[String(entry.pr)];
@@ -554,20 +563,20 @@ flowchart TD
   IDEA473["#473 — Leveraged sBTC via Zest + Bitflow<br/>skill idea / full-loop goal"]
 
   PRD550["#550 — bitflow-hodlmm-withdraw<br/>PRD issue"]
-  PR551["#551 — bitflow-hodlmm-withdraw<br/>implementation PR / MacBotMini"]
+  PR551["${MACBOTMINI_MARK} #551 — bitflow-hodlmm-withdraw<br/>implementation PR / MacBotMini"]
   PRD553["#553 — bitflow-hodlmm-deposit<br/>PRD issue"]
-  PR556["#556 — bitflow-hodlmm-deposit<br/>implementation PR / MacBotMini"]
+  PR556["${MACBOTMINI_MARK} #556 — bitflow-hodlmm-deposit<br/>implementation PR / MacBotMini"]
   PRD559["#559 — Bitflow HODLMM-Zest yield loop<br/>router PRD"]
   EXT340["aibtcdev/skills#340 — sbtc-yield-maximizer HODLMM leg<br/>upstream continuation / review-bound"]
 
   PRD566["#566 — zest-borrow-asset-primitive<br/>PRD issue / active borrow"]
-  PR572["#572 — zest-borrow-asset-primitive<br/>implementation PR / MacBotMini"]
+  PR572["${MACBOTMINI_MARK} #572 — zest-borrow-asset-primitive<br/>implementation PR / MacBotMini"]
   PRD573["#573 — zest-asset-deposit-primitive<br/>PRD issue"]
-  PR574["#574 — zest-asset-deposit-primitive<br/>implementation PR / MacBotMini"]
+  PR574["${MACBOTMINI_MARK} #574 — zest-asset-deposit-primitive<br/>implementation PR / MacBotMini"]
   PRD576["#576 — bitflow-swap-aggregator<br/>PRD issue"]
-  PR577["#577 — bitflow-swap-aggregator<br/>implementation PR / MacBotMini"]
+  PR577["${MACBOTMINI_MARK} #577 — bitflow-swap-aggregator<br/>implementation PR / MacBotMini"]
   PRD561["#561 — Bitflow + Zest sBTC leverage cycle<br/>forward-cycle controller PRD"]
-  PR578["#578 — bitflow-zest-sbtc-leverage-cycle<br/>composed controller PR / MacBotMini"]
+  PR578["${MACBOTMINI_MARK} #578 — bitflow-zest-sbtc-leverage-cycle<br/>composed controller PR / MacBotMini"]
   PRD562["#562 — sbtc-leverage-unwind-planner<br/>unwind / full-loop blocker"]
 
   OLD560["#560 — zest-borrow-asset primitive<br/>superseded older PRD"]
@@ -618,7 +627,7 @@ ${implementationClassLines}
   class EXT340 external
 \`\`\`
 
-Legend: yellow = skill idea / goal, blue = PRD issue, dark green = merged implementation PR, light green = open implementation PR, orange = draft PR, cyan = composed controller/router PRD, red = unresolved full-loop blocker, gray = historical/superseded, purple = external upstream dependency.
+Legend: yellow = skill idea / goal, blue = PRD issue, ${MACBOTMINI_MARK} = MacBotMini implementation PR, dark green = merged implementation PR, light green = open implementation PR, orange = draft PR, cyan = composed controller/router PRD, red = unresolved full-loop blocker, gray = historical/superseded, purple = external upstream dependency.
 
 ### MacBotMini Core Stack
 
