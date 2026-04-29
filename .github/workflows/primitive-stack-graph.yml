@@ -1,0 +1,44 @@
+name: Primitive Stack Graph Report
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+  issues:
+    types: [opened, edited, closed, reopened, labeled, unlabeled]
+  pull_request_target:
+    types: [opened, edited, synchronize, closed, reopened, ready_for_review, converted_to_draft]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: primitive-stack-graph-report
+  cancel-in-progress: true
+
+jobs:
+  sync-primitive-stack-graph:
+    name: Sync primitive stack graph
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out base repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Check primitive stack graph drift
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bun run scripts/primitive-stack-graph.ts check
+
+      - name: Sync managed graph comment
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bun run scripts/primitive-stack-graph.ts sync --overview-issue 558
