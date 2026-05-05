@@ -492,9 +492,18 @@ async function getBins(poolId: string): Promise<BinsResponse> {
 }
 
 async function getUserBins(wallet: string, poolId: string): Promise<Array<{ binId: number; userLiquidity: bigint; price?: string | number }>> {
-  const response = await fetchJson<UserBinsResponse>(
-    `${BITFLOW_API}/api/app/v1/users/${wallet}/positions/${poolId}/bins?fresh=true`
-  );
+  let response: UserBinsResponse;
+  try {
+    response = await fetchJson<UserBinsResponse>(
+      `${BITFLOW_API}/api/app/v1/users/${wallet}/positions/${poolId}/bins?fresh=true`
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.startsWith("HTTP 404 ") && message.includes("has no pool bins")) {
+      return [];
+    }
+    throw error;
+  }
   const bins = Array.isArray(response.bins) ? response.bins : [];
   return bins
     .map((bin) => ({
