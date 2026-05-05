@@ -274,7 +274,10 @@ async function readCheckpoint(wallet: string): Promise<Checkpoint | null> {
 async function writeCheckpoint(checkpoint: Checkpoint): Promise<Checkpoint> {
   await fs.mkdir(checkpointDir(), { recursive: true });
   const updated = { ...checkpoint, updatedAt: new Date().toISOString() };
-  await fs.writeFile(checkpointPath(checkpoint.wallet), `${JSON.stringify(updated, null, 2)}\n`, "utf8");
+  const finalPath = checkpointPath(checkpoint.wallet);
+  const tempPath = `${finalPath}.${process.pid}.${Date.now()}.tmp`;
+  await fs.writeFile(tempPath, `${JSON.stringify(updated, null, 2)}\n`, "utf8");
+  await fs.rename(tempPath, finalPath);
   return updated;
 }
 
@@ -421,6 +424,20 @@ function extractTxid(result: PrimitiveResult): string | null {
   return typeof tx?.txid === "string" ? tx.txid : null;
 }
 
+function requirePrimitiveTxid(name: string, result: PrimitiveResult): string {
+  requirePrimitiveSuccess(name, result);
+  const txid = extractTxid(result);
+  if (!txid) {
+    throw new BlockedError(
+      "PRIMITIVE_CONFIRMATION_MISSING",
+      `${name} returned success without a transaction id.`,
+      "Do not advance the route checkpoint until the primitive returns a confirmed txid.",
+      { primitive: name, result: result as JsonMap }
+    );
+  }
+  return txid;
+}
+
 async function confirmPrimitiveTxid(name: string, wallet: string, txid: string): Promise<TxConfirmation> {
   const tx = await fetchJson<{
     tx_status?: string;
@@ -457,16 +474,7 @@ async function confirmPrimitiveTxid(name: string, wallet: string, txid: string):
 }
 
 async function requireConfirmedPrimitiveLeg(name: string, wallet: string, result: PrimitiveResult): Promise<TxConfirmation> {
-  requirePrimitiveSuccess(name, result);
-  const txid = extractTxid(result);
-  if (!txid) {
-    throw new BlockedError(
-      "PRIMITIVE_CONFIRMATION_MISSING",
-      `${name} returned success without a transaction id.`,
-      "Do not advance the route checkpoint until the primitive returns a confirmed txid.",
-      { primitive: name, result: result as JsonMap }
-    );
-  }
+  const txid = requirePrimitiveTxid(name, result);
   return confirmPrimitiveTxid(name, wallet, txid);
 }
 
@@ -534,9 +542,19 @@ async function depositArgs(wallet: string, opts: SharedOptions): Promise<string[
 
 function moveArgs(wallet: string, opts: SharedOptions, confirmed: boolean): string[] {
   const args = ["--wallet", wallet, "--pool", ensurePool(opts.poolId)];
-  if (opts.range) args.push("--spread", opts.range.replace(":", ""));
+  if (opts.range) args.push("--spread", spreadFromRange(opts.range));
   if (confirmed) args.push("--confirm");
   return args;
+}
+
+function spreadFromRange(range: string): string {
+  const match = range.match(/^(-?\d+):(-?\d+)$/);
+  if (!match) {
+    throw new BlockedError("INVALID_RANGE", "--range must be formatted as <start>:<end>.", "Pass a range such as -1:1 or 0:3.");
+  }
+  const start = Number.parseInt(match[1], 10);
+  const end = Number.parseInt(match[2], 10);
+  return String(Math.abs(end - start));
 }
 
 function zestStatusArgs(): string[] {
@@ -650,7 +668,7 @@ async function routePreview(route: Route, dependencies: Primitive[], wallet: str
   }
   if (route === "hodlmm-rebalance") {
     const move = primitiveByName(dependencies, "hodlmm-move-liquidity");
-    preview.hodlmmMove = (await runPrimitive(move.entry!, "run", moveArgs(wallet, opts, false), wallet)) as JsonMap;
+    preview.hodlmmMove = (await runPrimitive(move.entry!, "scan", ["--wallet", wallet], wallet)) as JsonMap;
   }
   if (route === "hodlmm-to-zest" || route === "zest-to-hodlmm") {
     const zest = primitiveByName(dependencies, "zest-yield-manager");
@@ -888,8 +906,16 @@ async function runRoute(opts: RunOptions): Promise<void> {
     if (built.plan.route === "idle-to-hodlmm") {
       const deposit = primitiveByName(built.dependencies, "bitflow-hodlmm-deposit");
       const result = await runPrimitive(deposit.entry!, "run", [...await depositArgs(built.wallet, opts), "--wait-seconds", opts.waitSeconds || DEFAULT_WAIT_SECONDS, "--confirm", "DEPOSIT"], built.wallet);
-      const confirmation = await requireConfirmedPrimitiveLeg(deposit.name, built.wallet, result);
-      checkpoint = await writeCheckpoint({ ...checkpoint, step: "hodlmm_deposit_confirmed", txids: [...checkpoint.txids, confirmation.txid] });
+      const txid = requirePrimitiveTxid(deposit.name, result);
+      const txids = checkpoint.txids.includes(txid) ? checkpoint.txids : [...checkpoint.txids, txid];
+      checkpoint = await writeCheckpoint({
+        ...checkpoint,
+        txids,
+        nextRequiredAction: `Awaiting Hiro tx_status=success for ${txid}. If this process stops before completion, run resume --confirm=ROUTE --txid ${txid}.`,
+      });
+      const confirmation = await confirmPrimitiveTxid(deposit.name, built.wallet, txid);
+      const confirmedTxids = checkpoint.txids.includes(confirmation.txid) ? checkpoint.txids : [...checkpoint.txids, confirmation.txid];
+      checkpoint = await writeCheckpoint({ ...checkpoint, step: "hodlmm_deposit_confirmed", txids: confirmedTxids });
       checkpoint = await writeCheckpoint({ ...checkpoint, step: "complete", nextRequiredAction: "Route complete. Run status before considering another route." });
       success("run", { checkpoint, dependencies: built.dependencies, confirmations: { hodlmmDeposit: confirmation as unknown as JsonMap }, primitiveResults: { hodlmmDeposit: result as JsonMap } });
       return;
@@ -956,7 +982,7 @@ function addSharedOptions(command: Command): Command {
     .option("--min-apy-edge-bps <bps>", "minimum yield edge required before movement", DEFAULT_MIN_APY_EDGE_BPS)
     .option("--max-data-age-seconds <seconds>", "freshness window for route-critical reads", DEFAULT_MAX_DATA_AGE_SECONDS)
     .option("--min-gas-reserve-ustx <uSTX>", "minimum STX gas reserve", DEFAULT_MIN_GAS_RESERVE_USTX)
-    .option("--mempool-depth-limit <count>", "maximum allowed pending tx depth", DEFAULT_MEMPOOL_DEPTH_LIMIT)
+    .option("--mempool-depth-limit <count>", "maximum allowed pending tx depth; 0 means no pending sender transactions are allowed", DEFAULT_MEMPOOL_DEPTH_LIMIT)
     .option("--slippage-bps <bps>", "primitive slippage tolerance", DEFAULT_SLIPPAGE_BPS)
     .option("--wait-seconds <seconds>", "wait window passed to primitive write skills", DEFAULT_WAIT_SECONDS);
 }

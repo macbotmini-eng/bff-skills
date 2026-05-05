@@ -15,7 +15,7 @@ description: "Plans and runs HODLMM-Zest yield routes only through accepted prim
 5. Inspect `economicCheck`, `freshness`, and `state`; do not treat a route as ready when either check reports blocked or missing reads.
 6. Confirm route execution with the operator.
 7. Run `run --confirm=ROUTE` only after the plan is acceptable.
-8. Confirm each delegated write leg with that primitive's own confirmation token, then require a txid and Hiro `tx_status=success` before advancing to the next leg.
+8. Confirm each delegated write leg with that primitive's own confirmation token, persist the returned txid before Hiro polling, then require Hiro `tx_status=success` before marking the leg confirmed or advancing to the next leg.
 9. If interrupted, run `resume --confirm=ROUTE` only from a supported saved checkpoint.
 
 ## Guardrails
@@ -27,7 +27,7 @@ description: "Plans and runs HODLMM-Zest yield routes only through accepted prim
 - Never reject first-time HODLMM position creation solely because the wallet has no existing pool bins when the selected pool exists and exposes sBTC.
 - Never add dependency skills beyond the #559 PRD without a PRD update.
 - Never proceed without explicit `--confirm=ROUTE` for write execution.
-- Never mark any leg as confirmed without a txid that verifies as `tx_status=success` on Hiro.
+- Never mark any leg as confirmed without a txid that verifies as `tx_status=success` on Hiro. If Hiro confirmation is interrupted after broadcast, resume from the saved txid instead of rebroadcasting.
 - Never ignore `economicCheck`, `freshness`, or unresolved `state` fields in plan/status output.
 - Never ignore unresolved saved state.
 - Never expose secrets, private keys, mnemonics, passwords, or raw session payloads.

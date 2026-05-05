@@ -28,7 +28,7 @@ Agents need a sequencing layer above atomic primitives. A route from HODLMM to Z
 - This is a composed write skill and can move funds.
 - Mainnet only.
 - `run` and write-capable `resume` require `--confirm=ROUTE`.
-- Every delegated write leg must also use its primitive-specific confirmation token and return a txid that Hiro verifies as `tx_status=success` before this controller advances the checkpoint.
+- Every delegated write leg must also use its primitive-specific confirmation token and return a txid. The controller persists the txid before checking Hiro so interrupted confirmation can be recovered with `resume --txid`, then marks the leg confirmed only after Hiro verifies `tx_status=success`.
 - It refuses a new route when unresolved checkpoint state exists.
 - It shells out to primitive CLIs and only trusts a single JSON object from each primitive.
 - It does not import source from other skill directories.
@@ -114,4 +114,5 @@ Every command prints exactly one JSON object to stdout.
 - Checkpoints live at the standard AIBTC runtime state path for this skill: `~/.aibtc/state/bitflow-hodlmm-zest-yield-loop/<wallet>.json`.
 - Resume never blind-retries a write leg. It only advances a saved route from a supplied txid after Hiro confirms `tx_status=success` and the tx sender matches `--wallet`.
 - Auto-selection is conservative. When the route is ambiguous or comparable EV/freshness data is unavailable, the controller reports `hold`/blocked route context and requires explicit `--source` and `--target` instead of guessing.
+- `--mempool-depth-limit 0` is intentional: no pending sender transactions are allowed before a route write.
 - Mainnet proof belongs in the PR body, not in this generic skill description.
