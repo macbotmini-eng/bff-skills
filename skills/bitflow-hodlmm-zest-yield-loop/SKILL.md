@@ -64,6 +64,8 @@ Builds an ordered route plan by calling primitive read-only previews where avail
 bun run skills/bitflow-hodlmm-zest-yield-loop/bitflow-hodlmm-zest-yield-loop.ts plan --wallet <stacks-address> --source idle --target hodlmm --pool-id <pool-id> --amount-sats <amount>
 ```
 
+`plan` includes `economicCheck`, `freshness`, and `state` fields. When comparable HODLMM/Zest route data is unavailable, the controller reports the missing read instead of silently choosing a weaker route.
+
 ### run
 
 Executes the selected route only after explicit route confirmation. Every delegated write leg must return a txid, and Hiro must verify that txid as `tx_status=success` before the controller marks the leg confirmed or starts another leg.
@@ -109,5 +111,5 @@ Every command prints exactly one JSON object to stdout.
 - Cross-venue Zest write routes require the Zest dependency to return canonical position reads and confirmed transaction evidence. If it only returns a handoff, non-broadcast plan, direct `suppliedShares` value without conversion, or non-canonical market-contract read, this controller blocks instead of claiming execution.
 - Borrowing is intentionally outside scope. This skill does not call Zest borrow helpers; any future borrow composition would need a separate PRD update and mainnet-proofed helper version.
 - Checkpoints live at the standard AIBTC runtime state path for this skill: `~/.aibtc/state/bitflow-hodlmm-zest-yield-loop/<wallet>.json`.
-- Auto-selection is conservative. When the route is ambiguous, pass explicit `--source` and `--target`.
+- Auto-selection is conservative. When the route is ambiguous or comparable EV/freshness data is unavailable, the controller reports `hold`/blocked route context and requires explicit `--source` and `--target` instead of guessing.
 - Mainnet proof belongs in the PR body, not in this generic skill description.

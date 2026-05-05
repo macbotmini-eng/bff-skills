@@ -99,6 +99,9 @@ interface RoutePlan {
   executable: boolean;
   blockers: JsonMap[];
   steps: JsonMap[];
+  economicCheck?: JsonMap;
+  freshness?: JsonMap;
+  state?: JsonMap;
 }
 
 const SKILL_NAME = "bitflow-hodlmm-zest-yield-loop";
@@ -678,6 +681,43 @@ async function routeContext(opts: SharedOptions): Promise<JsonMap> {
   };
 }
 
+function buildEconomicCheck(opts: SharedOptions, plan: RoutePlan): JsonMap {
+  const amountSats = opts.amountSats || null;
+  const hasAmount = typeof amountSats === "string" && /^\d+$/.test(amountSats) && BigInt(amountSats) > 0n;
+  const requiredForMovement = plan.route !== "hold";
+  const blockedReasons: Json[] = [];
+  if (requiredForMovement && !hasAmount) blockedReasons.push("--amount-sats is required for route EV checks");
+  if (plan.route === "hodlmm-rebalance") blockedReasons.push("rebalance EV requires current HODLMM bin position and active-bin drift reads");
+  if (plan.route === "hodlmm-to-zest" || plan.route === "zest-to-hodlmm") {
+    blockedReasons.push("cross-venue EV requires canonical Zest position reads and comparable HODLMM opportunity reads");
+  }
+  return {
+    status: blockedReasons.length === 0 ? "passed_inputs_only" : "blocked",
+    minApyEdgeBps: opts.minApyEdgeBps || DEFAULT_MIN_APY_EDGE_BPS,
+    amountSats,
+    gasEstimateStatus: "delegated_to_primitives",
+    note: "This controller refuses automatic movement unless comparable route data is available; primitive write legs still run their own fee/slippage checks.",
+    blockedReasons,
+  };
+}
+
+function buildFreshness(opts: SharedOptions, plan: RoutePlan, preview: JsonMap): JsonMap {
+  const previewKeys = Object.keys(preview);
+  const missingRouteReads: Json[] = [];
+  if (plan.route === "hold" && (opts.source === "auto" || opts.target === "auto")) {
+    missingRouteReads.push("auto venue selection requires fresh HODLMM opportunity and Zest supply-yield reads");
+  }
+  if (plan.route === "hodlmm-to-zest" || plan.route === "zest-to-hodlmm") {
+    missingRouteReads.push("Zest write routes require canonical Zest position reads before execution");
+  }
+  return {
+    status: missingRouteReads.length === 0 ? "checked_by_preview" : "blocked",
+    maxDataAgeSeconds: opts.maxDataAgeSeconds || DEFAULT_MAX_DATA_AGE_SECONDS,
+    previewSources: previewKeys,
+    missingRouteReads,
+  };
+}
+
 function isAllowedFirstTimeHodlmmDepositPreview(name: string, result: PrimitiveResult, plan: RoutePlan, context: JsonMap): boolean {
   if (name !== "hodlmmDeposit") return false;
   if (!["idle-to-hodlmm", "zest-to-hodlmm"].includes(plan.route)) return false;
@@ -772,6 +812,14 @@ async function buildPlan(opts: SharedOptions, includePreview: boolean): Promise<
     plan.executable = false;
     plan.blockers.push(...previewBlockers);
   }
+  plan.economicCheck = buildEconomicCheck(opts, plan);
+  plan.freshness = buildFreshness(opts, plan, preview);
+  plan.state = {
+    checkpoint: checkpoint
+      ? { routeId: checkpoint.routeId, step: checkpoint.step, route: checkpoint.route, txids: checkpoint.txids, nextRequiredAction: checkpoint.nextRequiredAction || null }
+      : null,
+    stateFile: context.stateFile,
+  };
   return { wallet, dependencies, checkpoint, plan, preview, context };
 }
 
