@@ -9,7 +9,12 @@ import * as path from "path";
 type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
 type JsonMap = { [key: string]: Json };
 type Status = "success" | "blocked" | "error";
-type Step = "idle" | "borrow_confirmed" | "swap_confirmed" | "complete" | "blocked_partial_cycle" | "operator_cancelled";
+// Step union enumerates checkpoint states that have actual write paths.
+// `blocked_partial_cycle` was previously listed but never written — checkpoint
+// stays at its last confirmed step on mid-cycle error and `resume` picks it up
+// from there. Removed per arc0btc review #4230615771 nit 3 to avoid creating
+// false expectations for downstream consumers parsing the `step` field.
+type Step = "idle" | "borrow_confirmed" | "swap_confirmed" | "complete" | "operator_cancelled";
 
 interface Primitive {
   name: string;
@@ -37,6 +42,13 @@ interface Checkpoint {
   swapTxid?: string;
   depositTxid?: string;
   observedSbtcReceived?: string;
+  // Captured at borrow_confirmed: the actual STX amount the wallet received from the
+  // borrow primitive. Defensive against a future primitive version that deducts a
+  // protocol fee from the disbursed amount — if the field is not present in the
+  // primitive output, falls back to requestedBorrowAmountUstx with the note below.
+  // arc0btc review #4230615771 suggestion 1.
+  borrowReceivedAmountUstx?: string;
+  borrowReceivedSource?: "primitive_observed" | "fallback_to_requested";
   abortReason?: string;
   nextRequiredAction?: string;
 }
@@ -333,6 +345,13 @@ function extractObservedSbtc(result: PrimitiveResult): string | null {
   // balancesAfter payload is missing or unparseable, returns null so the caller throws
   // SWAP_OUTPUT_UNKNOWN instead of silently depositing the quoted amount under
   // adversarial slippage. Diego review #4230128713 blocking item 1.
+  //
+  // Unit assumption (arc0btc review #4230615771 question 2): `outputBalance` is in
+  // satoshis (native sBTC base units, no decimal normalization). This matches the
+  // established convention in aibtcdev/skills primitives — the deposit primitive
+  // accepts --amount in the same satoshi units. If a future swap-aggregator version
+  // ever switches to decimal sBTC normalization, this assumption breaks silently and
+  // the deposit amount would be off by 1e8.
   const data = result.data || {};
   const before = data.balances as JsonMap | undefined;
   const after = data.balancesAfter as JsonMap | undefined;
@@ -340,6 +359,28 @@ function extractObservedSbtc(result: PrimitiveResult): string | null {
   const afterOutput = asBigInt(after?.outputBalance);
   if (beforeOutput !== null && afterOutput !== null && afterOutput >= beforeOutput) {
     return (afterOutput - beforeOutput).toString();
+  }
+  return null;
+}
+
+// Extracts the actual received-amount-uSTX from a borrow primitive result, falling
+// back to null if not present. Defensive against future primitive versions that
+// deduct a protocol fee from the disbursed amount — caller decides how to handle a
+// missing field. arc0btc review #4230615771 suggestion 1.
+function extractBorrowedAmountUstx(result: PrimitiveResult): string | null {
+  const data = result.data || {};
+  // Try several plausible field names; the current borrow primitive does not yet
+  // expose a distinct "received" field, so this is forward-compatible.
+  const candidates = [
+    data.receivedAmountUstx,
+    data.receivedAmount,
+    (data.proof as JsonMap | undefined)?.receivedAmount,
+    (data.proof as JsonMap | undefined)?.amount,
+    data.amount,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && /^\d+$/.test(candidate) && BigInt(candidate) > 0n) return candidate;
+    if (typeof candidate === "number" && Number.isInteger(candidate) && candidate > 0) return candidate.toString();
   }
   return null;
 }
@@ -415,7 +456,7 @@ async function runPlan(opts: SharedOptions): Promise<void> {
       steps: [
         { step: "borrow", primitive: borrow.name, result: borrowPlan },
         { step: "swap", primitive: swap.name, result: swapPlan },
-        { step: "deposit", primitive: "zest-asset-deposit-primitive", result: "planned after swap confirms and observed sBTC amount is known" },
+        { step: "deposit", primitive: "zest-asset-deposit-primitive", result: { deferred: true, reason: "Planned after swap confirms and observed sBTC amount is known. Deposit args bind to the actual received-from-swap amount, not a quoted estimate." } },
       ],
     });
   } catch (error) {
@@ -425,7 +466,11 @@ async function runPlan(opts: SharedOptions): Promise<void> {
 
 async function continueFrom(checkpoint: Checkpoint, opts: RunOptions, dependencies: Primitive[]): Promise<Checkpoint> {
   const wallet = checkpoint.wallet;
-  const amount = checkpoint.requestedBorrowAmountUstx;
+  // Use the actual received amount when the borrow primitive reported one; fall
+  // back to the requested amount otherwise. Keeps swap input aligned with what
+  // the wallet actually holds, even if a future borrow primitive deducts fees.
+  // arc0btc review #4230615771 suggestion 1.
+  const amount = checkpoint.borrowReceivedAmountUstx ?? checkpoint.requestedBorrowAmountUstx;
   const swap = primitiveByName(dependencies, "bitflow-swap-aggregator");
   const deposit = primitiveByName(dependencies, "zest-asset-deposit-primitive");
   let current = checkpoint;
@@ -470,7 +515,19 @@ async function runCycle(opts: RunOptions): Promise<void> {
     let checkpoint = await writeCheckpoint(newCheckpoint(wallet, amount));
     const borrowResult = await runPrimitive(borrow.entry!, "run", [...borrowArgs(wallet, amount), ...primitiveGasArgs(opts), ...primitiveWaitArgs(opts), "--confirm", "BORROW"]);
     requirePrimitiveSuccess(borrow.name, borrowResult);
-    checkpoint = await writeCheckpoint({ ...checkpoint, step: "borrow_confirmed", borrowTxid: extractTxid(borrowResult) || undefined });
+    // Capture actual received amount from the borrow primitive's output (defensive
+    // against future fee-deducting versions). Falls back to requested amount when the
+    // primitive doesn't yet expose a distinct received field — current Zest borrows
+    // are exact-amount per arc0btc operational note. The fallback flag lets the swap
+    // leg surface the source if needed.
+    const borrowedActual = extractBorrowedAmountUstx(borrowResult);
+    checkpoint = await writeCheckpoint({
+      ...checkpoint,
+      step: "borrow_confirmed",
+      borrowTxid: extractTxid(borrowResult) || undefined,
+      borrowReceivedAmountUstx: borrowedActual ?? amount,
+      borrowReceivedSource: borrowedActual ? "primitive_observed" : "fallback_to_requested",
+    });
     checkpoint = await continueFrom(checkpoint, opts, dependencies);
     success("run", { checkpoint, dependencies });
   } catch (error) {
