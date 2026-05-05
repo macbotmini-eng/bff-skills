@@ -272,7 +272,13 @@ function sharedArgs(opts: SharedOptions): string[] {
 }
 
 function primitiveGasArgs(opts: SharedOptions): string[] {
-  return ["--min-gas-reserve-ustx", opts.minGasReserveUstx || DEFAULT_MIN_GAS_RESERVE_USTX];
+  // Includes mempool-depth-limit so every write-leg primitive (borrow, deposit) carries
+  // the same depth gate the swap leg gets via sharedArgs(). Per PRD safety req #5:
+  // "Mempool depth checked before every write leg." Diego review #4230128713 blocking item 2.
+  return [
+    "--min-gas-reserve-ustx", opts.minGasReserveUstx || DEFAULT_MIN_GAS_RESERVE_USTX,
+    "--mempool-depth-limit", opts.mempoolDepthLimit || DEFAULT_MEMPOOL_DEPTH_LIMIT,
+  ];
 }
 
 function primitiveWaitArgs(opts: SharedOptions): string[] {
@@ -322,6 +328,11 @@ function asBigInt(value: Json | undefined): bigint | null {
 }
 
 function extractObservedSbtc(result: PrimitiveResult): string | null {
+  // Fail-closed: returns the actual observed delta only. PRD scope requires "re-supply
+  // the actual received sBTC amount" — never the quoted/expected. If the swap primitive's
+  // balancesAfter payload is missing or unparseable, returns null so the caller throws
+  // SWAP_OUTPUT_UNKNOWN instead of silently depositing the quoted amount under
+  // adversarial slippage. Diego review #4230128713 blocking item 1.
   const data = result.data || {};
   const before = data.balances as JsonMap | undefined;
   const after = data.balancesAfter as JsonMap | undefined;
@@ -330,9 +341,7 @@ function extractObservedSbtc(result: PrimitiveResult): string | null {
   if (beforeOutput !== null && afterOutput !== null && afterOutput >= beforeOutput) {
     return (afterOutput - beforeOutput).toString();
   }
-  const quote = data.quote as JsonMap | undefined;
-  const quoted = quote?.quote;
-  return typeof quoted === "string" && /^\d+$/.test(quoted) ? quoted : null;
+  return null;
 }
 
 async function primitiveReadiness(dependencies: Primitive[], wallet: string): Promise<JsonMap> {
