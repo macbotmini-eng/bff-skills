@@ -436,6 +436,192 @@ async function runStatus(opts: SharedOptions): Promise<void> {
   }
 }
 
+// Plan-time gas baselines per leg (canonical mainnet observed values). The primitive
+// plan output is the authoritative number; these baselines fill the gas-roll-up when
+// a primitive plan response doesn't surface an explicit `feeUstx` field. Diego review
+// #4230128713 item 3.
+const GAS_BASELINE_BORROW_USTX = 70_000n;
+const GAS_BASELINE_SWAP_USTX = 50_000n;
+const GAS_BASELINE_DEPOSIT_USTX = 50_000n;
+
+// Walk a primitive plan output looking for the first numeric field with one of the
+// likely keys. Defensive against shape drift in primitive outputs.
+function extractFee(plan: PrimitiveResult, keys: string[]): bigint | null {
+  const data = plan.data;
+  if (!data || typeof data !== "object") return null;
+  const search = (value: unknown): bigint | null => {
+    if (!value || typeof value !== "object") return null;
+    for (const [k, v] of Object.entries(value)) {
+      if (keys.includes(k)) {
+        if (typeof v === "string" && /^\d+$/.test(v)) return BigInt(v);
+        if (typeof v === "number" && Number.isInteger(v) && v >= 0) return BigInt(v);
+      }
+      const nested = search(v);
+      if (nested !== null) return nested;
+    }
+    return null;
+  };
+  return search(data);
+}
+
+function extractSwapExpectedOutSats(swapPlan: PrimitiveResult): bigint | null {
+  const data = swapPlan.data;
+  if (!data || typeof data !== "object") return null;
+  const search = (value: unknown): bigint | null => {
+    if (!value || typeof value !== "object") return null;
+    for (const [k, v] of Object.entries(value)) {
+      if ((k === "expectedAmountOut" || k === "amountOut" || k === "minAmountOut") && (typeof v === "string" || typeof v === "number")) {
+        const s = String(v);
+        if (/^\d+$/.test(s) && BigInt(s) >= 0n) return BigInt(s);
+      }
+      const nested = search(v);
+      if (nested !== null) return nested;
+    }
+    return null;
+  };
+  return search(data);
+}
+
+// Fetches the wallet's current Zest position by shelling out to
+// zest-borrow-asset-primitive's `status` subcommand — same composition surface
+// already used by the controller's runStatus path. Avoids re-implementing the
+// canonical bitmap+position read in this controller. Returns null when the read
+// fails or the response shape doesn't surface usable values, so the gate output
+// surfaces a degraded-data state instead of throwing. Diego review #4230128713
+// item 3.
+interface ZestPositionSnapshot {
+  debtUstx: string | null;
+  collateralSats: string | null;
+  healthFactorBps: number | null;
+  raw: JsonMap;
+  fetchedAt: string;
+}
+
+async function readZestPositionViaPrimitive(borrow: Primitive, wallet: string): Promise<ZestPositionSnapshot | null> {
+  try {
+    const result = await runPrimitive(borrow.entry!, "status", [...borrowArgs(wallet)]);
+    if (result.status !== "success") return null;
+    const data = (result.data || {}) as JsonMap;
+    // Defensive scan for canonical fields. The borrow primitive surfaces these under
+    // `assets.borrow.scaledDebt` / `assets.collateral.amount` / `position` shapes,
+    // but the exact path varies by primitive version — walk for the first match.
+    const scan = (keys: string[]): string | null => {
+      const search = (value: unknown): string | null => {
+        if (!value || typeof value !== "object") return null;
+        for (const [k, v] of Object.entries(value)) {
+          if (keys.includes(k)) {
+            if (typeof v === "string" && /^\d+$/.test(v)) return v;
+            if (typeof v === "number") return String(v);
+            if (v && typeof v === "object" && "value" in (v as JsonMap)) {
+              const inner = (v as JsonMap).value;
+              if (typeof inner === "string" && /^\d+$/.test(inner)) return inner;
+            }
+          }
+          const nested = search(v);
+          if (nested !== null) return nested;
+        }
+        return null;
+      };
+      return search(data);
+    };
+    return {
+      debtUstx: scan(["currentDebtEstimate", "debt", "scaledDebt", "totalDebt"]),
+      collateralSats: scan(["amount", "collateralAmount", "totalCollateral"]),
+      healthFactorBps: null, // Health factor surfaces as a tuple field; left as a follow-up to read canonically once the primitive exposes it directly.
+      raw: data,
+      fetchedAt: new Date().toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Builds the plan-time economics aggregation per Diego review #4230128713 item 3.
+// Surfaces: per-leg gas, total cycle gas, swap price impact, projected debt
+// increase, projected collateral increase, projected post-cycle position deltas,
+// economic-meaningfulness flag. Items requiring USD conversion (post-cycle HF in
+// USD terms) are deferred — surfaces the raw deltas + current position so the
+// operator can apply their own price view.
+function buildEconomicCheck(opts: SharedOptions, amount: string, borrowPlan: PrimitiveResult, swapPlan: PrimitiveResult, position: ZestPositionSnapshot | null): JsonMap {
+  const borrowGasReported = extractFee(borrowPlan, ["feeUstx", "fee", "estimatedFee"]);
+  const swapGasReported = extractFee(swapPlan, ["feeUstx", "fee", "estimatedFee"]);
+  const borrowGas = borrowGasReported ?? GAS_BASELINE_BORROW_USTX;
+  const swapGas = swapGasReported ?? GAS_BASELINE_SWAP_USTX;
+  const depositGas = GAS_BASELINE_DEPOSIT_USTX; // deposit plan deferred until post-swap
+  const totalGas = borrowGas + swapGas + depositGas;
+
+  const expectedOutSats = extractSwapExpectedOutSats(swapPlan);
+  const amountInUstx = BigInt(amount);
+
+  // Implied rate: how many sats received per uSTX swapped. Operator can sanity-check
+  // this against their own market view before confirming.
+  const impliedSatsPerUstxBps = expectedOutSats !== null && amountInUstx > 0n
+    ? Number((expectedOutSats * 1_000_000n) / amountInUstx) // sats per 1e6 uSTX (= per 1 STX), scaled
+    : null;
+
+  // Economic-meaningfulness: gas-cost vs swap-output ratio. If gas exceeds 5% of
+  // the projected sBTC value (very rough proxy without USD prices), flag as not
+  // meaningful. Operator override implicit via just running anyway.
+  let economicallyMeaningful: boolean | null = null;
+  let meaningfulReason = "";
+  if (expectedOutSats !== null && expectedOutSats > 0n) {
+    // Rough ratio: total_gas in uSTX, expected_out in sats. Different units, but
+    // the ratio surfaces a "gas dominates" signal at very small amounts.
+    const ratio = (totalGas * 10000n) / amountInUstx; // gas as bps of borrowed amount
+    economicallyMeaningful = ratio < 500n; // gas < 5% of borrowed amount
+    meaningfulReason = `gas ${totalGas} uSTX vs borrowed ${amountInUstx} uSTX (gas-as-bps-of-borrow=${ratio})`;
+  } else {
+    meaningfulReason = "swap plan did not surface expectedAmountOut; cannot compute meaningfulness";
+  }
+
+  // Projected position delta — debt increases by exactly the borrow amount;
+  // collateral increases by the swap's expected output (subject to slippage at
+  // run time, which the swap primitive enforces via min-out postconditions).
+  const projection: JsonMap = {
+    delta: {
+      debtUstx: amountInUstx.toString(),
+      collateralSatsEstimate: expectedOutSats !== null ? expectedOutSats.toString() : null,
+      collateralSatsNote: "Estimate from swap plan's expectedAmountOut. Run-time deposit binds to the actual observed swap delta, not this estimate.",
+    },
+    postCycle: position ? {
+      debtUstx: position.debtUstx ? (BigInt(position.debtUstx) + amountInUstx).toString() : null,
+      collateralSats: position.collateralSats && expectedOutSats !== null
+        ? (BigInt(position.collateralSats) + expectedOutSats).toString()
+        : null,
+      healthFactorBps: position.healthFactorBps,
+      note: "Post-cycle HF in USD terms requires a price source — surfaced fields are raw native units. Operator applies their own price view.",
+    } : null,
+  };
+
+  return {
+    status: position ? "computed" : "partial_no_position_read",
+    currentPosition: position ? {
+      debtUstx: position.debtUstx,
+      collateralSats: position.collateralSats,
+      healthFactorBps: position.healthFactorBps,
+      fetchedAt: position.fetchedAt,
+    } : null,
+    gasEstimate: {
+      borrowUstx: borrowGas.toString(),
+      borrowSource: borrowGasReported ? "primitive_plan" : "controller_baseline",
+      swapUstx: swapGas.toString(),
+      swapSource: swapGasReported ? "primitive_plan" : "controller_baseline",
+      depositUstx: depositGas.toString(),
+      depositSource: "controller_baseline",
+      totalUstx: totalGas.toString(),
+    },
+    swapImpact: {
+      amountInUstx: amountInUstx.toString(),
+      expectedOutSats: expectedOutSats !== null ? expectedOutSats.toString() : null,
+      impliedSatsPerStxScaled: impliedSatsPerUstxBps,
+    },
+    projection,
+    economicallyMeaningful,
+    meaningfulReason,
+    note: "Diego review #4230128713 item 3 — plan-time economics aggregation. Items requiring USD conversion (post-cycle HF in USD terms, gas-vs-yield comparison) deferred; surfaced fields let operator do that math against their preferred price source.",
+  };
+}
+
 async function runPlan(opts: SharedOptions): Promise<void> {
   try {
     const wallet = ensureWallet(opts.wallet);
@@ -450,6 +636,12 @@ async function runPlan(opts: SharedOptions): Promise<void> {
     const swap = primitiveByName(dependencies, "bitflow-swap-aggregator");
     const borrowPlan = await runPrimitive(borrow.entry!, "plan", [...borrowArgs(wallet, amount), ...primitiveGasArgs(opts)]);
     const swapPlan = await runPrimitive(swap.entry!, "plan", swapArgs(wallet, amount, opts));
+    // Read current Zest position via the borrow primitive's status path (canonical
+    // bitmap + position read), then build the economics aggregation. Primitive
+    // is already invoked elsewhere in this controller; re-using the same
+    // composition surface keeps the read path consistent.
+    const position = await readZestPositionViaPrimitive(borrow, wallet);
+    const economicCheck = buildEconomicCheck(opts, amount, borrowPlan, swapPlan, position);
     success("plan", {
       route: "borrow-stx-swap-to-sbtc-resupply-sbtc",
       dependencies,
@@ -458,6 +650,7 @@ async function runPlan(opts: SharedOptions): Promise<void> {
         { step: "swap", primitive: swap.name, result: swapPlan },
         { step: "deposit", primitive: "zest-asset-deposit-primitive", result: { deferred: true, reason: "Planned after swap confirms and observed sBTC amount is known. Deposit args bind to the actual received-from-swap amount, not a quoted estimate." } },
       ],
+      economicCheck,
     });
   } catch (error) {
     fail("plan", error);
