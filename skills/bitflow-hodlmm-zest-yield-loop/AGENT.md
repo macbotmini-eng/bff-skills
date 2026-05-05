@@ -14,7 +14,8 @@ description: "Plans and runs HODLMM-Zest yield routes only through accepted prim
 4. Run `plan` with explicit `--source`, `--target`, amount, pool, and bin controls.
 5. Confirm route execution with the operator.
 6. Run `run --confirm=ROUTE` only after the plan is acceptable.
-7. If interrupted, run `resume --confirm=ROUTE` only from a supported saved checkpoint.
+7. Confirm each delegated write leg with that primitive's own confirmation token, then require a txid and Hiro `tx_status=success` before advancing to the next leg.
+8. If interrupted, run `resume --confirm=ROUTE` only from a supported saved checkpoint.
 
 ## Guardrails
 
@@ -24,6 +25,7 @@ description: "Plans and runs HODLMM-Zest yield routes only through accepted prim
 - Never run a Zest write leg through a handoff payload and call it proof.
 - Never add dependency skills beyond the #559 PRD without a PRD update.
 - Never proceed without explicit `--confirm=ROUTE` for write execution.
+- Never mark any leg as confirmed without a txid that verifies as `tx_status=success` on Hiro.
 - Never ignore unresolved saved state.
 - Never expose secrets, private keys, mnemonics, passwords, or raw session payloads.
 - Never describe this as a borrow, leverage, repay, or unwind skill.

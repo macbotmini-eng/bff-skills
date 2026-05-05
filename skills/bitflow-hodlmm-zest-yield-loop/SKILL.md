@@ -28,6 +28,7 @@ Agents need a sequencing layer above atomic primitives. A route from HODLMM to Z
 - This is a composed write skill and can move funds.
 - Mainnet only.
 - `run` and write-capable `resume` require `--confirm=ROUTE`.
+- Every delegated write leg must also use its primitive-specific confirmation token and return a txid that Hiro verifies as `tx_status=success` before this controller advances the checkpoint.
 - It refuses a new route when unresolved checkpoint state exists.
 - It shells out to primitive CLIs and only trusts a single JSON object from each primitive.
 - It does not import source from other skill directories.
@@ -64,7 +65,7 @@ bun run skills/bitflow-hodlmm-zest-yield-loop/bitflow-hodlmm-zest-yield-loop.ts 
 
 ### run
 
-Executes the selected route only after explicit confirmation.
+Executes the selected route only after explicit route confirmation. Every delegated write leg must return a txid, and Hiro must verify that txid as `tx_status=success` before the controller marks the leg confirmed or starts another leg.
 
 ```bash
 bun run skills/bitflow-hodlmm-zest-yield-loop/bitflow-hodlmm-zest-yield-loop.ts run --wallet <stacks-address> --source idle --target hodlmm --pool-id <pool-id> --amount-sats <amount> --confirm=ROUTE

@@ -42,6 +42,15 @@ interface PrimitiveResult {
   error?: JsonMap | string | null;
 }
 
+interface TxConfirmation {
+  txid: string;
+  status: string;
+  sender: string | null;
+  contract: string | null;
+  functionName: string | null;
+  result: string | null;
+}
+
 interface Checkpoint {
   version: number;
   routeId: string;
@@ -404,6 +413,52 @@ function extractTxid(result: PrimitiveResult): string | null {
   return typeof broadcast?.txid === "string" ? broadcast.txid : null;
 }
 
+async function requireConfirmedPrimitiveLeg(name: string, wallet: string, result: PrimitiveResult): Promise<TxConfirmation> {
+  requirePrimitiveSuccess(name, result);
+  const txid = extractTxid(result);
+  if (!txid) {
+    throw new BlockedError(
+      "PRIMITIVE_CONFIRMATION_MISSING",
+      `${name} returned success without a transaction id.`,
+      "Do not advance the route checkpoint until the primitive returns a confirmed txid.",
+      { primitive: name, result: result as JsonMap }
+    );
+  }
+
+  const tx = await fetchJson<{
+    tx_status?: string;
+    sender_address?: string;
+    contract_call?: { contract_id?: string; function_name?: string };
+    tx_result?: { repr?: string };
+  }>(`${HIRO_API}/extended/v1/tx/${encodeURIComponent(txid)}`, 30_000);
+
+  if (tx.tx_status !== "success") {
+    throw new BlockedError(
+      "PRIMITIVE_TX_NOT_CONFIRMED",
+      `${name} transaction is not confirmed as success.`,
+      "Wait for Hiro to report tx_status=success before resuming the route.",
+      { primitive: name, txid, txStatus: tx.tx_status || null }
+    );
+  }
+  if (tx.sender_address && tx.sender_address !== wallet) {
+    throw new BlockedError(
+      "PRIMITIVE_TX_SENDER_MISMATCH",
+      `${name} transaction sender does not match --wallet.`,
+      "Inspect the primitive signer configuration before continuing.",
+      { primitive: name, txid, sender: tx.sender_address, expectedWallet: wallet }
+    );
+  }
+
+  return {
+    txid,
+    status: tx.tx_status,
+    sender: tx.sender_address || null,
+    contract: tx.contract_call?.contract_id || null,
+    functionName: tx.contract_call?.function_name || null,
+    result: tx.tx_result?.repr || null,
+  };
+}
+
 function selectorArgs(opts: SharedOptions): string[] {
   const args: string[] = [];
   if (opts.binId) args.push("--bin-id", opts.binId);
@@ -760,11 +815,10 @@ async function runRoute(opts: RunOptions): Promise<void> {
     if (built.plan.route === "idle-to-hodlmm") {
       const deposit = primitiveByName(built.dependencies, "bitflow-hodlmm-deposit");
       const result = await runPrimitive(deposit.entry!, "run", [...await depositArgs(built.wallet, opts), "--wait-seconds", opts.waitSeconds || DEFAULT_WAIT_SECONDS, "--confirm", "DEPOSIT"], built.wallet);
-      requirePrimitiveSuccess(deposit.name, result);
-      const txid = extractTxid(result);
-      checkpoint = await writeCheckpoint({ ...checkpoint, step: "hodlmm_deposit_confirmed", txids: txid ? [txid] : checkpoint.txids });
+      const confirmation = await requireConfirmedPrimitiveLeg(deposit.name, built.wallet, result);
+      checkpoint = await writeCheckpoint({ ...checkpoint, step: "hodlmm_deposit_confirmed", txids: [...checkpoint.txids, confirmation.txid] });
       checkpoint = await writeCheckpoint({ ...checkpoint, step: "complete", nextRequiredAction: "Route complete. Run status before considering another route." });
-      success("run", { checkpoint, dependencies: built.dependencies, primitiveResults: { hodlmmDeposit: result as JsonMap } });
+      success("run", { checkpoint, dependencies: built.dependencies, confirmations: { hodlmmDeposit: confirmation as unknown as JsonMap }, primitiveResults: { hodlmmDeposit: result as JsonMap } });
       return;
     }
     throw new BlockedError("UNSUPPORTED_EXECUTION_ROUTE", `Route ${built.plan.route} is not executable in this controller version.`, "Use plan/status output to inspect blockers and install the missing proof-grade primitive surface.", { plan: built.plan });
