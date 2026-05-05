@@ -113,6 +113,8 @@ const DEFAULT_MIN_GAS_RESERVE_USTX = "500000";
 const DEFAULT_MEMPOOL_DEPTH_LIMIT = "0";
 const DEFAULT_SLIPPAGE_BPS = "100";
 const DEFAULT_WAIT_SECONDS = "240";
+const ZEST_CONFIRMED_WRITE_MESSAGE =
+  "The PRD names Zest supply/withdraw as required route legs. Before this controller can execute that leg, the installed Zest surface must read canonical Zest position data through v0-1-data.get-user-position, convert suppliedShares to asset units for economic checks, and return a txid that Hiro verifies as tx_status=success.";
 const PRIMITIVES: Array<Omit<Primitive, "entry">> = [
   {
     name: "bitflow-hodlmm-withdraw",
@@ -559,7 +561,7 @@ function chooseRoute(opts: SharedOptions): RoutePlan {
       route: "hodlmm-to-zest",
       reason: "Exit selected HODLMM bins, then supply resulting sBTC to Zest.",
       executable: false,
-      blockers: [{ code: "ZEST_CONFIRMED_WRITE_NOT_VERIFIED", message: "The PRD names Zest supply/withdraw as required route legs. The installed Zest surface must produce a confirmed tx result before this controller can execute that leg." }],
+      blockers: [{ code: "ZEST_CONFIRMED_WRITE_NOT_VERIFIED", message: ZEST_CONFIRMED_WRITE_MESSAGE }],
       steps: [
         { step: "hodlmm-withdraw", primitive: "bitflow-hodlmm-withdraw", confirmation: "EXIT" },
         { step: "zest-supply", primitive: "zest-yield-manager", status: "blocked-before-write" },
@@ -571,7 +573,7 @@ function chooseRoute(opts: SharedOptions): RoutePlan {
       route: "zest-to-hodlmm",
       reason: "Withdraw supplied sBTC from Zest, then deposit into selected HODLMM bins.",
       executable: false,
-      blockers: [{ code: "ZEST_CONFIRMED_WRITE_NOT_VERIFIED", message: "The PRD names Zest supply/withdraw as required route legs. The installed Zest surface must produce a confirmed tx result before this controller can execute that leg." }],
+      blockers: [{ code: "ZEST_CONFIRMED_WRITE_NOT_VERIFIED", message: ZEST_CONFIRMED_WRITE_MESSAGE }],
       steps: [
         { step: "zest-withdraw", primitive: "zest-yield-manager", status: "blocked-before-write" },
         { step: "hodlmm-deposit", primitive: "bitflow-hodlmm-deposit", confirmation: "DEPOSIT" },
@@ -676,12 +678,29 @@ async function routeContext(opts: SharedOptions): Promise<JsonMap> {
   };
 }
 
-function collectPreviewBlockers(preview: JsonMap): JsonMap[] {
+function isAllowedFirstTimeHodlmmDepositPreview(name: string, result: PrimitiveResult, plan: RoutePlan, context: JsonMap): boolean {
+  if (name !== "hodlmmDeposit") return false;
+  if (!["idle-to-hodlmm", "zest-to-hodlmm"].includes(plan.route)) return false;
+  const poolCheck = context.hodlmmPoolCheck as JsonMap | undefined;
+  if (poolCheck?.ok !== true) return false;
+  const errorText = JSON.stringify(stringify(result.error || null));
+  return errorText.includes("has no pool bins");
+}
+
+function collectPreviewBlockers(preview: JsonMap, plan: RoutePlan, context: JsonMap): JsonMap[] {
   const blockers: JsonMap[] = [];
   for (const [name, value] of Object.entries(preview)) {
     if (!value || typeof value !== "object" || Array.isArray(value)) continue;
     const result = value as PrimitiveResult;
     if (result.status && result.status !== "success") {
+      if (isAllowedFirstTimeHodlmmDepositPreview(name, result, plan, context)) {
+        context.firstTimeHodlmmDeposit = {
+          allowed: true,
+          reason: "No existing wallet pool bins were found, but the pool exists and first-time HODLMM position creation is valid.",
+          primitive: name,
+        };
+        continue;
+      }
       blockers.push({
         code: "PRIMITIVE_PREVIEW_BLOCKED",
         primitive: name,
@@ -748,7 +767,7 @@ async function buildPlan(opts: SharedOptions, includePreview: boolean): Promise<
     }
   }
   const preview = canPreview ? await routePreview(plan.route, dependencies, wallet, opts) : {};
-  const previewBlockers = collectPreviewBlockers(preview);
+  const previewBlockers = collectPreviewBlockers(preview, plan, context);
   if (previewBlockers.length > 0) {
     plan.executable = false;
     plan.blockers.push(...previewBlockers);

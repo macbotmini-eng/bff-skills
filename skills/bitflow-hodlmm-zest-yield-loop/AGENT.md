@@ -22,7 +22,8 @@ description: "Plans and runs HODLMM-Zest yield routes only through accepted prim
 - Never rebuild HODLMM deposit, HODLMM withdraw, or HODLMM move transaction internals in this controller.
 - Never import source from another skill directory.
 - Never proceed when a required primitive is missing, blocked, or returns invalid JSON.
-- Never run a Zest write leg through a handoff payload and call it proof.
+- Never run a Zest write leg through a handoff payload, direct unconverted `suppliedShares`, or non-canonical market-contract read and call it proof.
+- Never reject first-time HODLMM position creation solely because the wallet has no existing pool bins when the selected pool exists and exposes sBTC.
 - Never add dependency skills beyond the #559 PRD without a PRD update.
 - Never proceed without explicit `--confirm=ROUTE` for write execution.
 - Never mark any leg as confirmed without a txid that verifies as `tx_status=success` on Hiro.

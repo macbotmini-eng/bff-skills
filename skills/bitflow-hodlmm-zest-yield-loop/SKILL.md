@@ -34,7 +34,8 @@ Agents need a sequencing layer above atomic primitives. A route from HODLMM to Z
 - It does not import source from other skill directories.
 - It composes the accepted HODLMM selected-bin primitives from #551 and #556, as required by the #559 PRD.
 - It only treats existing registry surfaces as dependencies when they are named by the PRD and listed in the AIBTC skills directory.
-- Zest write legs block unless the installed Zest surface produces a confirmed transaction result that the controller can verify.
+- First-time HODLMM position creation in an existing sBTC pool is valid. A wallet with no prior pool bins must not be rejected when the pool metadata check passes.
+- Zest write legs block unless the installed Zest surface reads positions through `v0-1-data.get-user-position`, converts `suppliedShares` to asset units for economic checks, and produces a confirmed transaction result that the controller can verify.
 - It does not borrow, create leverage, repay, or unwind debt.
 
 ## Commands
@@ -103,7 +104,10 @@ Every command prints exactly one JSON object to stdout.
 ## Known constraints
 
 - This controller is the #471 HODLMM-Zest yield router surface, not the #473 leverage stack.
+- The differentiation from `stacks-alpha-engine` is the primitive-only composition contract: this skill sequences HODLMM + Zest primitives with checkpoints, while `stacks-alpha-engine` is a broader multi-protocol executor and five-stage safety pipeline.
 - The dependency list is constrained to the #559 PRD: #551/#556 for accepted HODLMM entry/exit, `hodlmm-move-liquidity` for HODLMM rebalance, and the existing AIBTC-listed Zest surface for Zest-side reads/writes.
-- Cross-venue Zest write routes require the Zest dependency to return confirmed transaction evidence. If it only returns a handoff or non-broadcast plan, this controller blocks instead of claiming execution.
+- Cross-venue Zest write routes require the Zest dependency to return canonical position reads and confirmed transaction evidence. If it only returns a handoff, non-broadcast plan, direct `suppliedShares` value without conversion, or non-canonical market-contract read, this controller blocks instead of claiming execution.
+- Borrowing is intentionally outside scope. This skill does not call Zest borrow helpers; any future borrow composition would need a separate PRD update and mainnet-proofed helper version.
+- Checkpoints live at the standard AIBTC runtime state path for this skill: `~/.aibtc/state/bitflow-hodlmm-zest-yield-loop/<wallet>.json`.
 - Auto-selection is conservative. When the route is ambiguous, pass explicit `--source` and `--target`.
 - Mainnet proof belongs in the PR body, not in this generic skill description.
