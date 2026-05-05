@@ -91,6 +91,7 @@ interface SharedOptions {
 
 interface RunOptions extends SharedOptions {
   confirm?: string;
+  txid?: string;
 }
 
 interface RoutePlan {
@@ -415,21 +416,12 @@ function extractTxid(result: PrimitiveResult): string | null {
   const direct = data.txid || proof?.txid;
   if (typeof direct === "string") return direct;
   const broadcast = data.broadcast as JsonMap | undefined;
-  return typeof broadcast?.txid === "string" ? broadcast.txid : null;
+  if (typeof broadcast?.txid === "string") return broadcast.txid;
+  const tx = data.tx as JsonMap | undefined;
+  return typeof tx?.txid === "string" ? tx.txid : null;
 }
 
-async function requireConfirmedPrimitiveLeg(name: string, wallet: string, result: PrimitiveResult): Promise<TxConfirmation> {
-  requirePrimitiveSuccess(name, result);
-  const txid = extractTxid(result);
-  if (!txid) {
-    throw new BlockedError(
-      "PRIMITIVE_CONFIRMATION_MISSING",
-      `${name} returned success without a transaction id.`,
-      "Do not advance the route checkpoint until the primitive returns a confirmed txid.",
-      { primitive: name, result: result as JsonMap }
-    );
-  }
-
+async function confirmPrimitiveTxid(name: string, wallet: string, txid: string): Promise<TxConfirmation> {
   const tx = await fetchJson<{
     tx_status?: string;
     sender_address?: string;
@@ -462,6 +454,20 @@ async function requireConfirmedPrimitiveLeg(name: string, wallet: string, result
     functionName: tx.contract_call?.function_name || null,
     result: tx.tx_result?.repr || null,
   };
+}
+
+async function requireConfirmedPrimitiveLeg(name: string, wallet: string, result: PrimitiveResult): Promise<TxConfirmation> {
+  requirePrimitiveSuccess(name, result);
+  const txid = extractTxid(result);
+  if (!txid) {
+    throw new BlockedError(
+      "PRIMITIVE_CONFIRMATION_MISSING",
+      `${name} returned success without a transaction id.`,
+      "Do not advance the route checkpoint until the primitive returns a confirmed txid.",
+      { primitive: name, result: result as JsonMap }
+    );
+  }
+  return confirmPrimitiveTxid(name, wallet, txid);
 }
 
 function selectorArgs(opts: SharedOptions): string[] {
@@ -904,6 +910,14 @@ async function runResume(opts: RunOptions): Promise<void> {
     if (!checkpoint || !unresolved(checkpoint)) {
       throw new BlockedError("NO_RESUMABLE_STATE", "No unresolved route state exists for this wallet.", "Run plan/run for a new route if appropriate.", { checkpoint });
     }
+    if (checkpoint.route === "idle-to-hodlmm" && checkpoint.step === "idle" && opts.txid) {
+      const confirmation = await confirmPrimitiveTxid("bitflow-hodlmm-deposit", wallet, opts.txid);
+      const txids = checkpoint.txids.includes(confirmation.txid) ? checkpoint.txids : [...checkpoint.txids, confirmation.txid];
+      let updated = await writeCheckpoint({ ...checkpoint, step: "hodlmm_deposit_confirmed", txids });
+      updated = await writeCheckpoint({ ...updated, step: "complete", nextRequiredAction: "Route complete. Run status before considering another route." });
+      success("resume", { checkpoint: updated, confirmations: { hodlmmDeposit: confirmation as unknown as JsonMap } });
+      return;
+    }
     throw new BlockedError("MANUAL_REVIEW_REQUIRED", `Checkpoint step ${checkpoint.step} requires manual review before resume.`, "Inspect wallet/protocol state and cancel or repair the route checkpoint.", { checkpoint });
   } catch (error) {
     fail("resume", error);
@@ -970,7 +984,8 @@ addSharedOptions(program.command("run").description("Run a confirmed route"))
   .action((opts) => runRoute({ ...normalizeOptions(opts), confirm: opts.confirm }));
 addSharedOptions(program.command("resume").description("Resume a supported interrupted route"))
   .option("--confirm <ROUTE>", "required confirmation token")
-  .action((opts) => runResume({ ...normalizeOptions(opts), confirm: opts.confirm }));
+  .option("--txid <txid>", "confirmed primitive txid to attach to the interrupted route")
+  .action((opts) => runResume({ ...normalizeOptions(opts), confirm: opts.confirm, txid: opts.txid }));
 addSharedOptions(program.command("cancel").description("Cancel unresolved saved route state")).action((opts) => runCancel(normalizeOptions(opts)));
 
 program.parse(process.argv);

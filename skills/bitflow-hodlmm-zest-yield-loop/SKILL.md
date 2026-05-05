@@ -76,10 +76,11 @@ bun run skills/bitflow-hodlmm-zest-yield-loop/bitflow-hodlmm-zest-yield-loop.ts 
 
 ### resume
 
-Continues only from supported saved checkpoints after explicit confirmation.
+Continues only from supported saved checkpoints after explicit confirmation. If a delegated primitive broadcast succeeded but the controller stopped before checkpoint advancement, pass the confirmed txid so the controller can verify it on Hiro and complete the saved route without rebroadcasting.
 
 ```bash
 bun run skills/bitflow-hodlmm-zest-yield-loop/bitflow-hodlmm-zest-yield-loop.ts resume --wallet <stacks-address> --confirm=ROUTE
+bun run skills/bitflow-hodlmm-zest-yield-loop/bitflow-hodlmm-zest-yield-loop.ts resume --wallet <stacks-address> --confirm=ROUTE --txid <confirmed-txid>
 ```
 
 ### cancel
@@ -111,5 +112,6 @@ Every command prints exactly one JSON object to stdout.
 - Cross-venue Zest write routes require the Zest dependency to return canonical position reads and confirmed transaction evidence. If it only returns a handoff, non-broadcast plan, direct `suppliedShares` value without conversion, or non-canonical market-contract read, this controller blocks instead of claiming execution.
 - Borrowing is intentionally outside scope. This skill does not call Zest borrow helpers; any future borrow composition would need a separate PRD update and mainnet-proofed helper version.
 - Checkpoints live at the standard AIBTC runtime state path for this skill: `~/.aibtc/state/bitflow-hodlmm-zest-yield-loop/<wallet>.json`.
+- Resume never blind-retries a write leg. It only advances a saved route from a supplied txid after Hiro confirms `tx_status=success` and the tx sender matches `--wallet`.
 - Auto-selection is conservative. When the route is ambiguous or comparable EV/freshness data is unavailable, the controller reports `hold`/blocked route context and requires explicit `--source` and `--target` instead of guessing.
 - Mainnet proof belongs in the PR body, not in this generic skill description.
