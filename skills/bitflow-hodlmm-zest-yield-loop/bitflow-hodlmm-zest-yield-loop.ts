@@ -559,6 +559,63 @@ async function fetchHodlmmPoolMetrics(poolId: string): Promise<HodlmmPoolMetrics
 // at run time.
 const HODLMM_DEPOSIT_GAS_USTX_BASELINE = 70_000n;
 
+interface HodlmmPoolMetricsWithSide extends HodlmmPoolMetrics {
+  sbtcSide: "x" | "y" | null;
+  poolContract: string | null;
+}
+
+// Pool-agnostic universe: classify by `types.includes("DLMM")`, not by poolId prefix.
+// Filters to active sBTC-containing DLMM pools (the route deposits idle sBTC, so the
+// pool must hold sBTC as token X or Y). Sorted by apr desc so callers can pick the
+// best rate. When --pool-id isn't provided on idle-to-hodlmm, the controller picks
+// universe[0] automatically per operator directive: "go with whatever pool is offering
+// the best rate at any given time."
+async function fetchHodlmmPoolUniverse(): Promise<HodlmmPoolMetricsWithSide[]> {
+  try {
+    const data = await fetchJson<{ data?: Array<{
+      poolId?: string;
+      apr?: number;
+      apr24h?: number;
+      lastActivityTimestamp?: number;
+      tvlUsd?: number;
+      tvlBtc?: number;
+      poolStatus?: boolean;
+      types?: string[];
+      poolContract?: string;
+      tokens?: { tokenX?: { contract?: string }; tokenY?: { contract?: string } };
+    }> }>(BITFLOW_APP_POOLS_API);
+    const fetchedAt = new Date().toISOString();
+    return (data.data || [])
+      .filter((entry) => Array.isArray(entry.types) && entry.types.includes("DLMM") && entry.poolStatus !== false)
+      .map((entry) => {
+        let sbtcSide: "x" | "y" | null = null;
+        if (entry.tokens?.tokenX?.contract === SBTC_CONTRACT) sbtcSide = "x";
+        else if (entry.tokens?.tokenY?.contract === SBTC_CONTRACT) sbtcSide = "y";
+        return {
+          poolId: String(entry.poolId || ""),
+          apr: typeof entry.apr === "number" ? entry.apr : 0,
+          apr24h: typeof entry.apr24h === "number" ? entry.apr24h : null,
+          lastActivityTimestamp: typeof entry.lastActivityTimestamp === "number" ? entry.lastActivityTimestamp : null,
+          tvlUsd: typeof entry.tvlUsd === "number" ? entry.tvlUsd : null,
+          tvlBtc: typeof entry.tvlBtc === "number" ? entry.tvlBtc : null,
+          fetchedAt,
+          sbtcSide,
+          poolContract: typeof entry.poolContract === "string" ? entry.poolContract : null,
+        };
+      })
+      .filter((entry) => entry.sbtcSide !== null)
+      .sort((a, b) => b.apr - a.apr);
+  } catch {
+    return [];
+  }
+}
+
+// Returns the highest-APR sBTC-containing DLMM pool from the universe, or null if
+// the universe is empty. Used for auto-pick when --pool-id is not provided.
+function pickBestHodlmmPool(universe: HodlmmPoolMetricsWithSide[]): HodlmmPoolMetricsWithSide | null {
+  return universe.length > 0 ? universe[0] : null;
+}
+
 async function depositArgs(wallet: string, opts: SharedOptions): Promise<string[]> {
   const poolId = ensurePool(opts.poolId);
   let amountX = opts.amountX || "0";
@@ -938,10 +995,46 @@ async function buildPlan(opts: SharedOptions, includePreview: boolean): Promise<
   // --min-apy-edge-bps + --max-data-age-seconds + projected break-even gates
   // (Diego review #4230349003 blocking items 1+2). Returns null silently on fetch
   // failure so the gate surfaces a degraded-data state.
+  // Single Bitflow API fetch covers both the chosen pool's enforcement metrics
+  // and the broader pool universe (operator-facing discovery). Pool-agnostic:
+  // filters by `types.includes("DLMM")`, not poolId prefix. When --pool-id isn't
+  // set on idle-to-hodlmm, auto-pick the highest-APR sBTC-containing DLMM pool —
+  // operator directive: "go with whatever pool is offering the best rate at any
+  // given time." Auto-pick is recorded in plan output so the operator sees which
+  // pool the controller chose.
+  const poolUniverse = (plan.route === "idle-to-hodlmm")
+    ? await fetchHodlmmPoolUniverse()
+    : [];
+  let autoPickedPoolId: string | null = null;
+  if (plan.route === "idle-to-hodlmm" && !opts.poolId && poolUniverse.length > 0) {
+    const best = pickBestHodlmmPool(poolUniverse);
+    if (best) {
+      autoPickedPoolId = best.poolId;
+      opts.poolId = best.poolId;
+      opts.sbtcSide = opts.sbtcSide || best.sbtcSide || "auto";
+    }
+  }
   const poolMetrics = (plan.route === "idle-to-hodlmm" && opts.poolId)
-    ? await fetchHodlmmPoolMetrics(opts.poolId)
+    ? (poolUniverse.find((p) => p.poolId === opts.poolId) || await fetchHodlmmPoolMetrics(opts.poolId))
     : null;
   plan.economicCheck = buildEconomicCheck(opts, plan, poolMetrics);
+  if (poolUniverse.length > 0) {
+    (plan.economicCheck as JsonMap).poolUniverse = poolUniverse.map((p) => ({
+      poolId: p.poolId,
+      aprPct: p.apr,
+      aprBps: Math.round(p.apr * 100),
+      apr24hPct: p.apr24h,
+      tvlUsd: p.tvlUsd,
+      tvlBtc: p.tvlBtc,
+      lastActivityTimestamp: p.lastActivityTimestamp,
+      sbtcSide: p.sbtcSide,
+    }));
+    (plan.economicCheck as JsonMap).poolUniverseFetchedAt = poolUniverse[0]?.fetchedAt || null;
+    if (autoPickedPoolId) {
+      (plan.economicCheck as JsonMap).autoPickedPoolId = autoPickedPoolId;
+      (plan.economicCheck as JsonMap).autoPickReason = "Highest-APR sBTC-containing DLMM pool. Override with --pool-id to pin a different pool.";
+    }
+  }
   // Live economic gate failure flips executability and surfaces the reasons in
   // top-level blockers so run path refuses to broadcast.
   if (plan.economicCheck.status === "blocked" && plan.executable) {
