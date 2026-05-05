@@ -520,6 +520,45 @@ async function detectSbtcSide(poolId: string): Promise<"x" | "y"> {
   throw new BlockedError("POOL_NOT_SBTC", `Pool ${poolId} does not expose sBTC as token X or token Y.`, "Choose an sBTC HODLMM pool for this router.");
 }
 
+interface HodlmmPoolMetrics {
+  poolId: string;
+  apr: number;
+  apr24h: number | null;
+  lastActivityTimestamp: number | null;
+  tvlUsd: number | null;
+  tvlBtc: number | null;
+  fetchedAt: string;
+}
+
+// Live pool APR + freshness data from the Bitflow app API. Used by buildEconomicCheck
+// to enforce --min-apy-edge-bps + --max-data-age-seconds gates on idle-to-hodlmm routes.
+// Returns null on fetch failure so the caller can surface a degraded-data state rather
+// than throw — the controller is honest about whether enforcement is live or unwired.
+async function fetchHodlmmPoolMetrics(poolId: string): Promise<HodlmmPoolMetrics | null> {
+  try {
+    const data = await fetchJson<{ data?: Array<{ poolId?: string; apr?: number; apr24h?: number; lastActivityTimestamp?: number; tvlUsd?: number; tvlBtc?: number }> }>(BITFLOW_APP_POOLS_API);
+    const pool = (data.data || []).find((entry) => entry.poolId === poolId);
+    if (!pool) return null;
+    return {
+      poolId,
+      apr: typeof pool.apr === "number" ? pool.apr : 0,
+      apr24h: typeof pool.apr24h === "number" ? pool.apr24h : null,
+      lastActivityTimestamp: typeof pool.lastActivityTimestamp === "number" ? pool.lastActivityTimestamp : null,
+      tvlUsd: typeof pool.tvlUsd === "number" ? pool.tvlUsd : null,
+      tvlBtc: typeof pool.tvlBtc === "number" ? pool.tvlBtc : null,
+      fetchedAt: new Date().toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Conservative gas baseline for HODLMM deposit on the canonical router. Surfaced as
+// a controller-level estimate so plan can compute days-to-break-even without
+// re-running the primitive's prepare-tx step. Real gas is reported by the primitive
+// at run time.
+const HODLMM_DEPOSIT_GAS_USTX_BASELINE = 70_000n;
+
 async function depositArgs(wallet: string, opts: SharedOptions): Promise<string[]> {
   const poolId = ensurePool(opts.poolId);
   let amountX = opts.amountX || "0";
@@ -705,22 +744,80 @@ async function routeContext(opts: SharedOptions): Promise<JsonMap> {
   };
 }
 
-function buildEconomicCheck(opts: SharedOptions, plan: RoutePlan): JsonMap {
+// Enforces --min-apy-edge-bps + --max-data-age-seconds gates using live Bitflow pool
+// data. Per Diego review #4230349003 blocking items 1+2: previously these flags were
+// echoed in output but never compared. Now: when route is idle-to-hodlmm and a live
+// pool metric is available, the controller hard-gates on (a) APY in bps >= threshold,
+// (b) pool freshness within max age, and (c) projected days-to-break-even within bound.
+// For other routes (hodlmm-to-zest etc.), enforcement remains deferred until canonical
+// Zest reads land — labelled honestly in the output.
+function buildEconomicCheck(opts: SharedOptions, plan: RoutePlan, poolMetrics: HodlmmPoolMetrics | null): JsonMap {
   const amountSats = opts.amountSats || null;
   const hasAmount = typeof amountSats === "string" && /^\d+$/.test(amountSats) && BigInt(amountSats) > 0n;
   const requiredForMovement = plan.route !== "hold";
+  const minEdgeBps = Number(opts.minApyEdgeBps || DEFAULT_MIN_APY_EDGE_BPS);
+  const maxAgeSeconds = Number(opts.maxDataAgeSeconds || DEFAULT_MAX_DATA_AGE_SECONDS);
   const blockedReasons: Json[] = [];
   if (requiredForMovement && !hasAmount) blockedReasons.push("--amount-sats is required for route EV checks");
   if (plan.route === "hodlmm-rebalance") blockedReasons.push("rebalance EV requires current HODLMM bin position and active-bin drift reads");
   if (plan.route === "hodlmm-to-zest" || plan.route === "zest-to-hodlmm") {
     blockedReasons.push("cross-venue EV requires canonical Zest position reads and comparable HODLMM opportunity reads");
   }
+
+  let liveGate: JsonMap | null = null;
+  if (plan.route === "idle-to-hodlmm" && hasAmount) {
+    if (!poolMetrics) {
+      blockedReasons.push("Bitflow pool metrics unreachable — cannot enforce APY-edge or break-even gates");
+      liveGate = { status: "unreachable" };
+    } else {
+      const observedAprPct = poolMetrics.apr;
+      const observedAprBps = Math.round(observedAprPct * 100); // apr is decimal % → bps
+      const ageSeconds = poolMetrics.lastActivityTimestamp
+        ? Math.max(0, Math.floor(Date.now() / 1000) - poolMetrics.lastActivityTimestamp)
+        : null;
+      const passesEdge = observedAprBps >= minEdgeBps;
+      const passesFreshness = ageSeconds == null || ageSeconds <= maxAgeSeconds;
+      // Projected economics: daily fee revenue assumes apr is annualized.
+      // dailyFeeSats ≈ amount-sats * (apr/100) / 365.
+      const amountBig = BigInt(amountSats!);
+      const dailyFeeSats = (amountBig * BigInt(Math.round(observedAprPct * 100))) / BigInt(365 * 100 * 100);
+      const gasUstx = HODLMM_DEPOSIT_GAS_USTX_BASELINE;
+      const daysToBreakEven = dailyFeeSats > 0n ? Number((gasUstx * 100n) / dailyFeeSats) / 100 : null;
+      const breakevenBound = 30; // controller-level bound, configurable in a follow-up
+      const passesBreakeven = daysToBreakEven == null || daysToBreakEven <= breakevenBound;
+      if (!passesEdge) blockedReasons.push(`MIN_APY_EDGE_NOT_MET: pool ${poolMetrics.poolId} APR ${observedAprBps}bps below --min-apy-edge-bps ${minEdgeBps}`);
+      if (!passesFreshness) blockedReasons.push(`STALE_POOL_DATA: pool ${poolMetrics.poolId} last activity ${ageSeconds}s ago, max-data-age-seconds=${maxAgeSeconds}`);
+      if (!passesBreakeven) blockedReasons.push(`BELOW_BREAKEVEN: projected ${daysToBreakEven}d to break even at ${observedAprPct}% APR (bound ${breakevenBound}d)`);
+      liveGate = {
+        status: passesEdge && passesFreshness && passesBreakeven ? "enforced" : "blocked",
+        observedAprPct,
+        observedAprBps,
+        minApyEdgeBps: minEdgeBps,
+        passesEdge,
+        ageSeconds,
+        maxDataAgeSeconds: maxAgeSeconds,
+        passesFreshness,
+        amountSats,
+        projectedDailyFeeSats: dailyFeeSats.toString(),
+        gasUstxBaseline: gasUstx.toString(),
+        daysToBreakEven,
+        breakevenBoundDays: breakevenBound,
+        passesBreakeven,
+        poolFetchedAt: poolMetrics.fetchedAt,
+      };
+    }
+  }
+
   return {
-    status: blockedReasons.length === 0 ? "passed_inputs_only" : "blocked",
-    minApyEdgeBps: opts.minApyEdgeBps || DEFAULT_MIN_APY_EDGE_BPS,
+    status: blockedReasons.length === 0 ? (liveGate ? "enforced" : "passed_inputs_only") : "blocked",
+    minApyEdgeBps: minEdgeBps,
+    maxDataAgeSeconds: maxAgeSeconds,
     amountSats,
-    gasEstimateStatus: "delegated_to_primitives",
-    note: "This controller refuses automatic movement unless comparable route data is available; primitive write legs still run their own fee/slippage checks.",
+    gasEstimateStatus: liveGate ? "controller_baseline_with_primitive_authoritative" : "delegated_to_primitives",
+    liveGate,
+    note: liveGate
+      ? "idle-to-hodlmm routes enforce --min-apy-edge-bps + --max-data-age-seconds + projected days-to-break-even using live Bitflow pool metrics; the primitive write leg additionally runs its own fee/slippage checks."
+      : "This controller refuses automatic movement unless comparable route data is available; primitive write legs still run their own fee/slippage checks. Live enforcement requires a poolId + amount-sats on the idle-to-hodlmm route.",
     blockedReasons,
   };
 }
@@ -836,7 +933,24 @@ async function buildPlan(opts: SharedOptions, includePreview: boolean): Promise<
     plan.executable = false;
     plan.blockers.push(...previewBlockers);
   }
-  plan.economicCheck = buildEconomicCheck(opts, plan);
+  // Fetch live pool metrics from Bitflow API when the route is idle-to-hodlmm and
+  // a pool-id was provided — buildEconomicCheck uses this to enforce
+  // --min-apy-edge-bps + --max-data-age-seconds + projected break-even gates
+  // (Diego review #4230349003 blocking items 1+2). Returns null silently on fetch
+  // failure so the gate surfaces a degraded-data state.
+  const poolMetrics = (plan.route === "idle-to-hodlmm" && opts.poolId)
+    ? await fetchHodlmmPoolMetrics(opts.poolId)
+    : null;
+  plan.economicCheck = buildEconomicCheck(opts, plan, poolMetrics);
+  // Live economic gate failure flips executability and surfaces the reasons in
+  // top-level blockers so run path refuses to broadcast.
+  if (plan.economicCheck.status === "blocked" && plan.executable) {
+    plan.executable = false;
+    const reasons = (plan.economicCheck.blockedReasons || []) as Json[];
+    for (const reason of reasons) {
+      plan.blockers.push({ code: "ECONOMIC_GATE_BLOCKED", message: reason });
+    }
+  }
   plan.freshness = buildFreshness(opts, plan, preview);
   plan.state = {
     checkpoint: checkpoint
