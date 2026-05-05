@@ -50,6 +50,12 @@ interface Checkpoint {
   createdAt: string;
   updatedAt: string;
   nextRequiredAction: string;
+  // Nonce-manager state (PRD safety req #6 + Checkpoint shape requirement). Captured
+  // after acquireNonce() runs and before broadcast so a crash mid-cycle leaves a
+  // recoverable checkpoint with the in-flight nonce identifier. Released at
+  // hiroStatus terminal state with the appropriate flags.
+  nonce?: number | null;
+  nonceState?: "acquired" | "released_success" | "released_failed" | "released_rejected" | null;
 }
 
 class BlockedError extends Error {
@@ -72,6 +78,20 @@ const DEFAULT_MEMPOOL_DEPTH_LIMIT = 0;
 const DEFAULT_HANDOFF_LABEL = "bitflow-hodlmm-zest-yield-loop";
 const STATE_ROOT = path.join(os.homedir(), ".aibtc", "state", "bitflow-funding-coordinator");
 const SWAP_SKILL = path.join("skills", "bitflow-swap-aggregator", "bitflow-swap-aggregator.ts");
+const NONCE_MANAGER_SKILL = path.join("skills", "nonce-manager", "nonce-manager.ts");
+// Expected swap function names on Bitflow's executable router contracts. Used by
+// runResume to verify a synthesized checkpoint actually points at a swap tx and not
+// some unrelated success tx — Diego review #4230235768 blocking item 3.
+const EXPECTED_SWAP_FUNCTIONS = new Set<string>([
+  "swap-helper-a",
+  "swap-helper-b",
+  "swap-univ2v2",
+  "swap-univ2v2-2-hop",
+  "swap-univ2v2-3-hop",
+  "swap-x-for-y",
+  "swap-y-for-x",
+  "add-relative-liquidity-same-multi", // dlmm router
+]);
 
 function stringify(value: unknown): Json {
   if (typeof value === "bigint") return value.toString();
@@ -261,6 +281,41 @@ async function runPrimitive(args: string[]): Promise<JsonMap> {
   return parsed;
 }
 
+// Shell out to the nonce-manager skill for sender-nonce serialization across
+// concurrent writers. PRD safety req #6: "Nonce-manager must serialize write
+// execution: acquire → write → release." Diego review #4230235768 blocking item 1.
+async function runNonceManager(args: string[]): Promise<JsonMap> {
+  const fullArgs = ["run", NONCE_MANAGER_SKILL, ...args];
+  const child = spawn("bun", fullArgs, { cwd: process.cwd(), env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  child.stdout.on("data", (c) => stdout.push(Buffer.from(c)));
+  child.stderr.on("data", (c) => stderr.push(Buffer.from(c)));
+  const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
+  const out = Buffer.concat(stdout).toString("utf8").trim();
+  const err = Buffer.concat(stderr).toString("utf8").trim();
+  if (!out && code !== 0) throw new Error(`nonce-manager failed with exit ${code}${err ? `: ${err.slice(0, 240)}` : ""}`);
+  if (!out) throw new Error("nonce-manager returned empty output");
+  try { return JSON.parse(out) as JsonMap; } catch { throw new Error(`nonce-manager returned non-JSON output: ${out.slice(0, 240)}`); }
+}
+
+async function acquireNonce(wallet: string): Promise<number> {
+  const result = await runNonceManager(["acquire", "--address", wallet]);
+  const data = result.data as JsonMap | undefined;
+  const nonce = (data?.nonce as number | undefined) ?? (result.nonce as number | undefined);
+  if (typeof nonce !== "number" || !Number.isInteger(nonce) || nonce < 0) {
+    throw new BlockedError("NONCE_ACQUIRE_FAILED", "nonce-manager did not return a usable nonce.", "Run nonce-manager doctor + sync before retrying.", { result });
+  }
+  return nonce;
+}
+
+async function releaseNonce(wallet: string, nonce: number, outcome: "success" | "failed" | "rejected"): Promise<void> {
+  const args = ["release", "--address", wallet, "--nonce", String(nonce)];
+  if (outcome === "failed") args.push("--failed");
+  if (outcome === "rejected") args.push("--failed", "--rejected");
+  await runNonceManager(args);
+}
+
 async function fetchJson<T>(url: string): Promise<T> {
   const response = await fetch(url);
   if (!response.ok) {
@@ -431,11 +486,32 @@ async function runFunding(opts: RunOptions): Promise<void> {
     const plan = await runPrimitive(toCliArgs(opts, "plan"));
     let checkpoint = await writeCheckpoint(newCheckpoint(opts, plan));
 
-    const runOpts = { ...opts, waitSeconds: "0" };
-    const primitive = await runPrimitive(toCliArgs(runOpts, "run"));
-    const txid = extractTxid(primitive);
-    if (!txid) {
-      throw new BlockedError("PRIMITIVE_TXID_MISSING", "bitflow-swap-aggregator did not return a txid.", "Inspect primitive output and do not retry until broadcast state is understood.", { primitive });
+    // Acquire nonce-manager lock BEFORE broadcast — PRD safety req #6.
+    // The acquired nonce serves as the file-locked serialization token across
+    // concurrent writers; the primitive fetches its own broadcast nonce from Hiro
+    // (they will match because both consult the same source while we hold the lock).
+    const nonce = await acquireNonce(wallet);
+    checkpoint = await writeCheckpoint({ ...checkpoint, nonce, nonceState: "acquired", nextRequiredAction: "Broadcast funding swap" });
+
+    let primitive: JsonMap;
+    let txid: string | null = null;
+    try {
+      const runOpts = { ...opts, waitSeconds: "0" };
+      primitive = await runPrimitive(toCliArgs(runOpts, "run"));
+      txid = extractTxid(primitive);
+      if (!txid) {
+        // Primitive returned but no txid — assume rejected before mempool, roll back nonce.
+        await releaseNonce(wallet, nonce, "rejected");
+        await writeCheckpoint({ ...checkpoint, nonceState: "released_rejected", nextRequiredAction: "Inspect primitive output before retry." });
+        throw new BlockedError("PRIMITIVE_TXID_MISSING", "bitflow-swap-aggregator did not return a txid.", "Inspect primitive output and do not retry until broadcast state is understood.", { primitive });
+      }
+    } catch (err) {
+      if (!(err instanceof BlockedError)) {
+        // Broadcast itself threw — assume rejected, release nonce.
+        await releaseNonce(wallet, nonce, "rejected").catch(() => undefined);
+        await writeCheckpoint({ ...checkpoint, nonceState: "released_rejected", nextRequiredAction: "Inspect primitive failure before retry." });
+      }
+      throw err;
     }
     checkpoint = await writeCheckpoint({
       ...checkpoint,
@@ -452,21 +528,30 @@ async function runFunding(opts: RunOptions): Promise<void> {
     const status = String(proof.status ?? "unknown");
 
     if (status !== "success") {
+      // Tx was broadcast but didn't confirm success — release nonce as failed (broadcast,
+      // nonce IS consumed even if the tx fails on-chain per nonce-manager spec).
+      await releaseNonce(wallet, nonce, "failed").catch(() => undefined);
       checkpoint = await writeCheckpoint({
         ...checkpoint,
         hiroStatus: status,
+        nonceState: "released_failed",
         nextRequiredAction: "Run resume --txid after Hiro reports tx_status=success",
       });
       throw new BlockedError("TX_NOT_CONFIRMED", "Funding txid is recorded but Hiro has not confirmed success.", "Use resume --txid after the transaction confirms; do not rebroadcast blindly.", { checkpoint: checkpoint as unknown as JsonMap, proof });
     }
 
+    await releaseNonce(wallet, nonce, "success");
     checkpoint = await writeCheckpoint({
       ...checkpoint,
       step: "complete",
       hiroStatus: "success",
+      nonceState: "released_success",
       nextRequiredAction: "Funding complete; downstream strategy can consume handoff.",
     });
-    success("run", fundingEnvelope(opts, primitive, { routeReady: true, checkpoint: checkpoint as unknown as JsonMap, proof }));
+    // Surface txid + hiroStatus at top-level of envelope per PRD output contract
+    // (Diego review #4230235768 item 4) — they were previously buried in nested
+    // proof + checkpoint objects, contradicting AGENT.md's own surface-discipline.
+    success("run", fundingEnvelope(opts, primitive, { txid, hiroStatus: "success", routeReady: true, checkpoint: checkpoint as unknown as JsonMap, proof }));
   } catch (error) {
     fail("run", error);
   }
@@ -484,6 +569,46 @@ async function runResume(opts: SharedOptions): Promise<void> {
     if (status !== "success") {
       throw new BlockedError("TX_NOT_CONFIRMED", "Hiro has not confirmed this funding txid as success.", "Wait for confirmation and rerun resume --txid; do not rebroadcast.", { checkpoint: checkpoint as unknown as JsonMap | null, proof });
     }
+
+    // PRD safety req #9 + Diego review #4230235768 blocking item 2: verify the
+    // on-chain sender matches --wallet. Without this, anyone could pass any success
+    // txid and get a routeReady: true synthesized checkpoint pointing at someone
+    // else's funds.
+    const sender = (mined?.sender_address as string | undefined) ?? null;
+    if (!sender || sender !== wallet) {
+      throw new BlockedError(
+        "RESUME_SENDER_MISMATCH",
+        `Hiro reports sender ${sender ?? "<unknown>"} for txid ${txid}, which does not match --wallet ${wallet}.`,
+        "Resume can only verify a tx broadcast by the same wallet. Inspect the txid before retrying.",
+        { txid, sender, wallet, proof }
+      );
+    }
+
+    // PRD safety req #13 + Diego review #4230235768 blocking item 3: verify the
+    // on-chain tx is actually a Bitflow swap function. A success txid alone is
+    // not proof of a swap — it could be any contract call from this wallet.
+    const fnName = ((mined?.contract_call as JsonMap | undefined)?.function_name as string | undefined) ?? null;
+    if (!fnName || !EXPECTED_SWAP_FUNCTIONS.has(fnName)) {
+      throw new BlockedError(
+        "RESUME_TX_NOT_SWAP",
+        `Hiro reports contract function ${fnName ?? "<unknown>"} for txid ${txid}; expected a Bitflow swap function (one of: ${[...EXPECTED_SWAP_FUNCTIONS].join(", ")}).`,
+        "Resume requires a tx whose contract_call.function_name matches a known Bitflow swap function. Inspect the txid before retrying.",
+        { txid, function_name: fnName, expected: [...EXPECTED_SWAP_FUNCTIONS], proof }
+      );
+    }
+
+    // If no local checkpoint, refuse to synthesize tokenOut from operator input —
+    // require explicit --token-out so the handoff payload's claimed target token
+    // is grounded in operator intent, not a default fallback.
+    if (!checkpoint && !opts.tokenOut) {
+      throw new BlockedError(
+        "RESUME_REQUIRES_TOKEN_OUT",
+        "No local checkpoint exists for this wallet, so --token-out is required to synthesize a resume payload.",
+        "Pass --token-out explicitly so the handoff readyToken matches a known target.",
+        { txid, wallet }
+      );
+    }
+
     const completed = await writeCheckpoint({
       ...(checkpoint ?? {
         version: 1,
@@ -504,9 +629,10 @@ async function runResume(opts: SharedOptions): Promise<void> {
       nextRequiredAction: "Funding complete; downstream strategy can consume handoff.",
     });
     success("resume", {
+      txid,
+      hiroStatus: "success",
       fundingRoute: fundingRoute({ ...opts, tokenIn: completed.tokenIn, tokenOut: completed.tokenOut }),
       wallet,
-      txid,
       routeReady: true,
       checkpoint: completed as unknown as JsonMap,
       proof,
