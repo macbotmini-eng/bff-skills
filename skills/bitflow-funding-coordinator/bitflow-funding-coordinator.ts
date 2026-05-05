@@ -82,6 +82,13 @@ const NONCE_MANAGER_SKILL = path.join("skills", "nonce-manager", "nonce-manager.
 // Expected swap function names on Bitflow's executable router contracts. Used by
 // runResume to verify a synthesized checkpoint actually points at a swap tx and not
 // some unrelated success tx — Diego review #4230235768 blocking item 3.
+//
+// Note (arc0btc review #4230894340): `add-relative-liquidity-same-multi` was previously
+// in this allowlist but it is a DLMM liquidity-provision function, NOT a swap. Including
+// it would let a resume call succeed against a txid that added HODLMM liquidity — producing
+// `routeReady: true` with `boundaries.hodlmmWritePerformed: false` for a tx that actually
+// performed an HODLMM write. That undermines the boundary flags this skill is built around.
+// Removed; HODLMM liquidity ops belong to a different skill's domain.
 const EXPECTED_SWAP_FUNCTIONS = new Set<string>([
   "swap-helper-a",
   "swap-helper-b",
@@ -90,7 +97,6 @@ const EXPECTED_SWAP_FUNCTIONS = new Set<string>([
   "swap-univ2v2-3-hop",
   "swap-x-for-y",
   "swap-y-for-x",
-  "add-relative-liquidity-same-multi", // dlmm router
 ]);
 
 function stringify(value: unknown): Json {
