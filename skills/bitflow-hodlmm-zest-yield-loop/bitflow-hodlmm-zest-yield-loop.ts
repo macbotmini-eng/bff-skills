@@ -553,11 +553,17 @@ async function fetchHodlmmPoolMetrics(poolId: string): Promise<HodlmmPoolMetrics
   }
 }
 
-// Conservative gas baseline for HODLMM deposit on the canonical router. Surfaced as
-// a controller-level estimate so plan can compute days-to-break-even without
-// re-running the primitive's prepare-tx step. Real gas is reported by the primitive
-// at run time.
-const HODLMM_DEPOSIT_GAS_USTX_BASELINE = 70_000n;
+// HODLMM deposit gas, expressed in satoshis at current STX/BTC rates (~0–21 sats
+// range — depends on STX/BTC price). Used in break-even projection where daily fee
+// revenue is in sats; both sides of the comparison must be in the same unit. Real
+// gas in uSTX is reported by the primitive at run time; this baseline is a
+// controller-level approximation for plan-time economics only.
+//
+// Per arc0btc 2026-05-05T22:08Z review on PR #582: a prior version used a uSTX
+// baseline (70_000n) compared directly against sats — different units inflated
+// gas ~3,300× and made BELOW_BREAKEVEN fire on every route. Override via a future
+// --gas-sats flag if STX/BTC rates diverge meaningfully from the assumption.
+const HODLMM_DEPOSIT_GAS_SATS_APPROX = 21n;
 
 interface HodlmmPoolMetricsWithSide extends HodlmmPoolMetrics {
   sbtcSide: "x" | "y" | null;
@@ -838,8 +844,9 @@ function buildEconomicCheck(opts: SharedOptions, plan: RoutePlan, poolMetrics: H
       // dailyFeeSats ≈ amount-sats * (apr/100) / 365.
       const amountBig = BigInt(amountSats!);
       const dailyFeeSats = (amountBig * BigInt(Math.round(observedAprPct * 100))) / BigInt(365 * 100 * 100);
-      const gasUstx = HODLMM_DEPOSIT_GAS_USTX_BASELINE;
-      const daysToBreakEven = dailyFeeSats > 0n ? Number((gasUstx * 100n) / dailyFeeSats) / 100 : null;
+      // Both sides in sats — see HODLMM_DEPOSIT_GAS_SATS_APPROX comment for why.
+      const gasSats = HODLMM_DEPOSIT_GAS_SATS_APPROX;
+      const daysToBreakEven = dailyFeeSats > 0n ? Number((gasSats * 100n) / dailyFeeSats) / 100 : null;
       const breakevenBound = 30; // controller-level bound, configurable in a follow-up
       const passesBreakeven = daysToBreakEven == null || daysToBreakEven <= breakevenBound;
       if (!passesEdge) blockedReasons.push(`MIN_APY_EDGE_NOT_MET: pool ${poolMetrics.poolId} APR ${observedAprBps}bps below --min-apy-edge-bps ${minEdgeBps}`);
@@ -856,7 +863,7 @@ function buildEconomicCheck(opts: SharedOptions, plan: RoutePlan, poolMetrics: H
         passesFreshness,
         amountSats,
         projectedDailyFeeSats: dailyFeeSats.toString(),
-        gasUstxBaseline: gasUstx.toString(),
+        gasSatsApprox: gasSats.toString(),
         daysToBreakEven,
         breakevenBoundDays: breakevenBound,
         passesBreakeven,
