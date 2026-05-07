@@ -485,6 +485,12 @@ async function runFunding(opts: RunOptions): Promise<void> {
     if (opts.confirm !== CONFIRM_TOKEN) {
       throw new BlockedError("CONFIRMATION_REQUIRED", "This write skill requires --confirm=FUND.", "Review plan output and rerun with --confirm=FUND.");
     }
+    // Parse all operator-supplied integer flags BEFORE acquiring the nonce-manager
+    // lock. parseInteger throws on malformed input ("abc", "-1", etc.); a throw
+    // after acquireNonce would fall through to the outer catch and `fail("run",
+    // error)` does not release the nonce — manual recovery would be required.
+    // Diego review observation #1.
+    const waitSeconds = parseInteger(opts.waitSeconds, DEFAULT_WAIT_SECONDS, "--wait-seconds");
     const existing = await readCheckpoint(wallet);
     if (isUnresolved(existing)) {
       throw new BlockedError("UNRESOLVED_CHECKPOINT", "A previous funding checkpoint is unresolved.", "Use resume --txid if a transaction was broadcast, or cancel if the operator has verified no write should continue.", { checkpoint: existing as unknown as JsonMap });
@@ -501,8 +507,18 @@ async function runFunding(opts: RunOptions): Promise<void> {
 
     let primitive: JsonMap;
     let txid: string | null = null;
+    // Track whether the swap primitive subprocess was invoked. Any non-BlockedError
+    // throw with this flag set must be treated as POTENTIALLY post-broadcast — the
+    // primitive may have submitted the tx before the throw originated (e.g.,
+    // JSON.parse failure on returned stdout, txid-extraction traversal failure).
+    // In that case the nonce IS consumed, so releasing as "rejected" (= not
+    // consumed) would let the next write reuse the nonce and conflict with the
+    // mined tx. Conservative default: release as "failed" once broadcastAttempted
+    // is true. Diego review observation #2.
+    let broadcastAttempted = false;
     try {
       const runOpts = { ...opts, waitSeconds: "0" };
+      broadcastAttempted = true;
       primitive = await runPrimitive(toCliArgs(runOpts, "run"));
       txid = extractTxid(primitive);
       if (!txid) {
@@ -513,9 +529,15 @@ async function runFunding(opts: RunOptions): Promise<void> {
       }
     } catch (err) {
       if (!(err instanceof BlockedError)) {
-        // Broadcast itself threw — assume rejected, release nonce.
-        await releaseNonce(wallet, nonce, "rejected").catch(() => undefined);
-        await writeCheckpoint({ ...checkpoint, nonceState: "released_rejected", nextRequiredAction: "Inspect primitive failure before retry." });
+        // Non-BlockedError throw inside the broadcast region. If broadcastAttempted
+        // is true the throw could be post-broadcast (primitive submitted tx then
+        // failed parsing/extraction); be conservative and treat the nonce as
+        // consumed. If false, the throw originated before the primitive was
+        // invoked and the nonce is genuinely not consumed.
+        const outcome = broadcastAttempted ? "failed" : "rejected";
+        const stateLabel = broadcastAttempted ? "released_failed" : "released_rejected";
+        await releaseNonce(wallet, nonce, outcome).catch(() => undefined);
+        await writeCheckpoint({ ...checkpoint, nonceState: stateLabel, nextRequiredAction: "Inspect primitive failure before retry." });
       }
       throw err;
     }
@@ -528,7 +550,6 @@ async function runFunding(opts: RunOptions): Promise<void> {
     });
 
     const immediateStatus = String((primitive.data as JsonMap | undefined)?.proof && ((primitive.data as JsonMap).proof as JsonMap).status || "");
-    const waitSeconds = parseInteger(opts.waitSeconds, DEFAULT_WAIT_SECONDS, "--wait-seconds");
     const mined = immediateStatus === "success" ? null : await waitForTx(txid, waitSeconds);
     const proof = immediateStatus === "success" ? ((primitive.data as JsonMap).proof as JsonMap) : txProof(txid, mined);
     const status = String(proof.status ?? "unknown");
