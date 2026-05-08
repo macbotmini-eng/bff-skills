@@ -99,6 +99,25 @@ const EXPECTED_SWAP_FUNCTIONS = new Set<string>([
   "swap-y-for-x",
 ]);
 
+// Funding modes the v1 surface accepts. `dca-chunk` follows the same code path as
+// `one-shot` for now (deferred per PRD); validation here keeps the contract honest
+// so `--mode banana` is rejected upfront instead of silently being treated as
+// `one-shot`. Closes BitflowFinance/bff-skills#597 item 4.
+const FUNDING_MODES = ["one-shot", "dca-chunk"] as const;
+type FundingMode = (typeof FUNDING_MODES)[number];
+
+function resolveFundingMode(rawMode: string | undefined): FundingMode {
+  if (rawMode === undefined || rawMode === "") return "one-shot";
+  if (!(FUNDING_MODES as readonly string[]).includes(rawMode)) {
+    throw new BlockedError(
+      "INVALID_MODE",
+      `--mode must be one of ${FUNDING_MODES.join(", ")} (received '${rawMode}').`,
+      "Pass --mode one-shot for single-shot funding or --mode dca-chunk (deferred — same code path as one-shot in v1).",
+    );
+  }
+  return rawMode as FundingMode;
+}
+
 function stringify(value: unknown): Json {
   if (typeof value === "bigint") return value.toString();
   if (Array.isArray(value)) return value.map(stringify);
@@ -182,7 +201,7 @@ function newCheckpoint(opts: SharedOptions, plan: JsonMap): Checkpoint {
     version: 1,
     routeId: crypto.createHash("sha256").update(`${wallet}:${tokenIn}:${tokenOut}:${amountIn}:${createdAt}`).digest("hex").slice(0, 16),
     wallet,
-    mode: opts.mode ?? "one-shot",
+    mode: resolveFundingMode(opts.mode),
     tokenIn,
     tokenOut,
     amountIn,
@@ -219,7 +238,7 @@ function fundingEnvelope(opts: SharedOptions, primitive: JsonMap, extra: JsonMap
   const readyAmount = extractOutputBalance(primitive);
   return {
     fundingRoute: fundingRoute(opts),
-    mode: opts.mode ?? "one-shot",
+    mode: resolveFundingMode(opts.mode),
     wallet: opts.wallet ?? null,
     tokenIn: opts.tokenIn ?? null,
     tokenOut: opts.tokenOut ?? null,
@@ -370,20 +389,47 @@ function extractTxid(value: unknown): string | null {
   });
 }
 
+// Parse Clarity `(ok u<atomic>)` literal into a JS number — used by --target-out
+// enforcement to read the actual swap output from the Hiro tx_result.repr.
+// Returns null on `(err ...)`, malformed shapes, or non-finite numbers.
+function parseClarityOkUint(repr: string): number | null {
+  const match = repr.match(/^\(ok u(\d+)\)$/);
+  if (!match) return null;
+  const n = Number(match[1]);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Explicit-path extractors against the bitflow-swap-aggregator's known schema.
+// First-match DFS was previously used here and would silently return the wrong
+// value if the primitive's output gained a sibling key with the same name at a
+// shallower depth. In particular extractOutputBalance was ambiguous between
+// `data.balances.outputBalance` (pre-write) and `data.balancesAfter.outputBalance`
+// (post-write); explicit paths always prefer the post-write value where present.
+// Closes BitflowFinance/bff-skills#597 item 5.
+function readScalar(value: Json | undefined): Json | null {
+  if (typeof value === "string" || typeof value === "number") return String(value);
+  return null;
+}
+
 function extractExpectedOutput(value: unknown): Json | null {
-  const quote = walk(value, (key, child) => {
-    if ((key === "quote" || key === "expectedAmountOut") && (typeof child === "string" || typeof child === "number")) return String(child);
-    return null;
-  });
-  return quote;
+  const data = (value as JsonMap | undefined)?.data as JsonMap | undefined;
+  if (!data) return null;
+  const quote = data.quote as JsonMap | undefined;
+  if (quote) {
+    const inner = readScalar(quote.quote);
+    if (inner !== null) return inner;
+    const ea = readScalar(quote.expectedAmountOut);
+    if (ea !== null) return ea;
+  }
+  return readScalar(data.expectedAmountOut);
 }
 
 function extractOutputBalance(value: unknown): Json | null {
-  const outputBalance = walk(value, (key, child) => {
-    if (key === "outputBalance" && (typeof child === "string" || typeof child === "number")) return String(child);
-    return null;
-  });
-  return outputBalance;
+  const data = (value as JsonMap | undefined)?.data as JsonMap | undefined;
+  if (!data) return null;
+  const after = readScalar((data.balancesAfter as JsonMap | undefined)?.outputBalance);
+  if (after !== null) return after;
+  return readScalar((data.balances as JsonMap | undefined)?.outputBalance);
 }
 
 function txProof(txid: string, tx: JsonMap | null): JsonMap {
@@ -414,10 +460,17 @@ async function fileExists(filePath: string): Promise<boolean> {
 }
 
 async function dependencySignals(): Promise<JsonMap> {
+  // nonceManagerDeclared was previously hardcoded `true`; that hid an opaque-error
+  // failure mode where `runFunding` would throw at acquireNonce time if
+  // nonce-manager.ts was absent. Tying it to the same fileExists check used for
+  // nonceManagerLocal makes `doctor` honestly reflect availability so the operator
+  // sees a clean `dependencies.nonceManagerDeclared: false` upfront.
+  // Closes BitflowFinance/bff-skills#597 item 2.
+  const nonceManagerLocal = await fileExists(path.join("skills", "nonce-manager", "nonce-manager.ts"));
   return {
     bitflowSwapAggregator: await fileExists(SWAP_SKILL),
-    nonceManagerLocal: await fileExists(path.join("skills", "nonce-manager", "nonce-manager.ts")),
-    nonceManagerDeclared: true,
+    nonceManagerLocal,
+    nonceManagerDeclared: nonceManagerLocal,
     noncePolicy: "serialize funding writes with nonce-manager when available; never run overlapping local checkpoints",
   };
 }
@@ -500,8 +553,15 @@ async function runFunding(opts: RunOptions): Promise<void> {
 
     // Acquire nonce-manager lock BEFORE broadcast — PRD safety req #6.
     // The acquired nonce serves as the file-locked serialization token across
-    // concurrent writers; the primitive fetches its own broadcast nonce from Hiro
-    // (they will match because both consult the same source while we hold the lock).
+    // concurrent writers (file lock at ~/.aibtc/nonces/<wallet>.lock).
+    // CAVEAT: The Bitflow swap primitive currently fetches its OWN broadcast
+    // nonce from Hiro independently of this lock — they line up in the common
+    // case because both consult the same Hiro state while the lock is held,
+    // but a concurrent writer that doesn't participate in this lock could
+    // race the primitive's Hiro-fetch and steal a slot. The lock prevents
+    // OUR concurrent writers from racing each other; it does NOT serialize
+    // against external writers. If the primitive becomes a nonce-manager
+    // participant, this caveat goes away. Closes BitflowFinance/bff-skills#597 item 3.
     const nonce = await acquireNonce(wallet);
     checkpoint = await writeCheckpoint({ ...checkpoint, nonce, nonceState: "acquired", nextRequiredAction: "Broadcast funding swap" });
 
@@ -575,6 +635,47 @@ async function runFunding(opts: RunOptions): Promise<void> {
       nonceState: "released_success",
       nextRequiredAction: "Funding complete; downstream strategy can consume handoff.",
     });
+
+    // PRD safety req: --target-out is "Desired minimum target-token output".
+    // v1 accepted the flag but never enforced it; arc0btc + diego both flagged
+    // this — a strategy consuming the handoff that needs a minimum sBTC amount
+    // could not rely on `routeReady:true` to mean the floor was met. Now: if
+    // --target-out is set, parse proof.result (Clarity `(ok u<atomic>)`) against
+    // the primitive's declared tokenOut decimals, compare to the operator floor.
+    // The swap is on-chain and the nonce is released — this is a contract signal
+    // for downstream consumers, not a rollback. Closes BitflowFinance/bff-skills#597 item 1.
+    if (opts.targetOut !== undefined && opts.targetOut !== "") {
+      const targetOutDecimal = Number.parseFloat(opts.targetOut);
+      if (!Number.isFinite(targetOutDecimal) || targetOutDecimal < 0) {
+        throw new BlockedError(
+          "INVALID_TARGET_OUT",
+          `--target-out must be a non-negative decimal number (received '${opts.targetOut}').`,
+          "Re-run with a valid --target-out or omit the flag.",
+          { txid, checkpoint: checkpoint as unknown as JsonMap, proof },
+        );
+      }
+      const actualOutAtomic = parseClarityOkUint(String(proof.result ?? ""));
+      const decimalsRaw = (((primitive.data as JsonMap | undefined)?.tokens as JsonMap | undefined)?.output as JsonMap | undefined)?.tokenDecimals;
+      const decimals = typeof decimalsRaw === "number" ? decimalsRaw : Number(decimalsRaw);
+      if (actualOutAtomic === null || !Number.isFinite(decimals)) {
+        throw new BlockedError(
+          "TARGET_OUT_UNVERIFIABLE",
+          `--target-out=${opts.targetOut} was specified but actual swap output could not be parsed from proof.result='${proof.result ?? "null"}' or token decimals could not be read from primitive.data.tokens.output.tokenDecimals.`,
+          "Inspect proof + primitive output before relying on routeReady:true; the swap is on-chain regardless.",
+          { txid, checkpoint: checkpoint as unknown as JsonMap, proof, parsedActualAtomic: actualOutAtomic, decimals: Number.isFinite(decimals) ? decimals : null },
+        );
+      }
+      const actualOutDecimal = actualOutAtomic / Math.pow(10, decimals);
+      if (actualOutDecimal < targetOutDecimal) {
+        throw new BlockedError(
+          "TARGET_OUT_NOT_MET",
+          `Funding swap completed but actual output ${actualOutDecimal} is below --target-out=${targetOutDecimal}.`,
+          "The swap is on-chain (txid recorded) and the nonce is released. Downstream consumers must treat routeReady as false; do not rebroadcast.",
+          { txid, actualOut: actualOutDecimal, targetOut: targetOutDecimal, checkpoint: checkpoint as unknown as JsonMap, proof },
+        );
+      }
+    }
+
     // Surface txid + hiroStatus at top-level of envelope per PRD output contract
     // (Diego review #4230235768 item 4) — they were previously buried in nested
     // proof + checkpoint objects, contradicting AGENT.md's own surface-discipline.
@@ -641,7 +742,7 @@ async function runResume(opts: SharedOptions): Promise<void> {
         version: 1,
         routeId: crypto.createHash("sha256").update(`${wallet}:${txid}`).digest("hex").slice(0, 16),
         wallet,
-        mode: opts.mode ?? "one-shot",
+        mode: resolveFundingMode(opts.mode),
         tokenIn: opts.tokenIn ?? "unknown",
         tokenOut: opts.tokenOut ?? "unknown",
         amountIn: opts.amountIn ?? null,
