@@ -1782,16 +1782,47 @@ async function cmdResume(opts: { wallet: string; confirm?: string }): Promise<vo
       );
     }
 
+    // Refuse to resume from any "planned but not broadcast" state — that means a leg
+    // was selected but never hit chain. There is no on-chain reality to advance from.
+    // Operator must either re-run the unwind from a clean state or cancel.
+    // Per PRD safety: resume must NEVER silently advance past an unbroadcast leg
+    // (arc0btc CHANGES_REQUESTED #4240418473 second blocker).
+    const PLANNED_BUT_UNBROADCAST_STATES = new Set([
+      "unwind_plan_created",
+      "optional_swap_for_repay_planned",
+      "repay_planned",
+      "optional_collateral_withdraw_planned",
+      "optional_residual_swap_planned",
+    ]);
+    if (PLANNED_BUT_UNBROADCAST_STATES.has(String(checkpoint.state))) {
+      throw new BlockedError(
+        "UNRESOLVED_CHECKPOINT",
+        `Checkpoint state is "${checkpoint.state}" — a leg was planned but no broadcast was recorded. Resume cannot advance past an unbroadcast leg.`,
+        "Either run cancel to discard this plan and start fresh, or re-run from a fresh wallet state if the leg never actually hit chain.",
+        { checkpoint: checkpoint as unknown as JsonMap }
+      );
+    }
+
     // Verify chain status of all recorded leg txids matches checkpoint.
     const txVerifications: JsonMap[] = [];
-    const txFields: Array<{ field: keyof CheckpointFile; legName: string }> = [
-      { field: "swapTxId" as keyof CheckpointFile, legName: "swap-for-repay" },
-      { field: "repayTxId" as keyof CheckpointFile, legName: "repay" },
-      { field: "withdrawTxId" as keyof CheckpointFile, legName: "collateral-withdraw" },
-      { field: "residualSwapTxId" as keyof CheckpointFile, legName: "residual-swap" },
+    const txFields: Array<{ field: keyof CheckpointFile; legName: string; broadcastState: string; confirmedState: string }> = [
+      { field: "swapTxId" as keyof CheckpointFile, legName: "swap-for-repay", broadcastState: "optional_swap_for_repay_broadcast", confirmedState: "optional_swap_for_repay_confirmed" },
+      { field: "repayTxId" as keyof CheckpointFile, legName: "repay", broadcastState: "repay_broadcast", confirmedState: "repay_confirmed" },
+      { field: "withdrawTxId" as keyof CheckpointFile, legName: "collateral-withdraw", broadcastState: "optional_collateral_withdraw_broadcast", confirmedState: "optional_collateral_withdraw_confirmed" },
+      { field: "residualSwapTxId" as keyof CheckpointFile, legName: "residual-swap", broadcastState: "optional_residual_swap_broadcast", confirmedState: "optional_residual_swap_confirmed" },
     ];
-    for (const { field, legName } of txFields) {
+    for (const { field, legName, broadcastState } of txFields) {
       const txid = checkpoint[field];
+      const stateClaim = String(checkpoint.state);
+      // Refuse if checkpoint claims this leg's broadcast state but no txid is recorded.
+      if (stateClaim === broadcastState && (typeof txid !== "string" || txid.length === 0)) {
+        throw new BlockedError(
+          "CHECKPOINT_CHAIN_DIVERGENCE",
+          `Checkpoint state claims ${legName} was broadcast but no txid recorded. Cannot reconcile against chain.`,
+          "Run cancel to mark this checkpoint resolved, then reconcile manually if any partial state exists on chain.",
+          { state: stateClaim, legName, expectedField: String(field) }
+        );
+      }
       if (typeof txid === "string" && txid.length > 0) {
         const { status, raw } = await verifyTxStatus(txid);
         txVerifications.push({ leg: legName, txid, observedStatus: status, explorer: `${EXPLORER}/${txid}?chain=mainnet` });
@@ -1807,20 +1838,62 @@ async function cmdResume(opts: { wallet: string; confirm?: string }): Promise<vo
       }
     }
 
-    // All recorded legs are success. If state was already "complete", just acknowledge.
+    // If state was already "complete", just acknowledge.
     if (checkpoint.state === "complete") {
       success(action, { unwindId: checkpoint.unwindId, state: "complete", message: "Checkpoint already complete; no resume needed.", txVerifications });
       return;
     }
 
-    // Auto-advance the checkpoint to "complete" since all recorded legs are confirmed and there's no further write to perform from a clean state.
-    // Per PRD: resume is "Resumes an unresolved unwind from checkpoint state."
-    // If chain says all is done, we mark complete and free the wallet for new writes.
+    // Canonical on-chain reality check: re-read the wallet's current Zest position.
+    // The checkpoint claims success; verify the actual debt has been reduced as planned.
+    // If on-chain debt is still ≥ pre-run debt minus repayTarget (allowing for accrued
+    // interest), the unwind did NOT actually achieve its objective even if all recorded
+    // txids show success — refuse to mark complete.
+    let canonicalReadFailed = false;
+    let postPosition: ZestPosition | null = null;
+    try {
+      const debtAssetSymbol = String(checkpoint.debtAsset);
+      const debtAsset = resolveAsset(debtAssetSymbol);
+      postPosition = await readZestPosition(opts.wallet, debtAsset);
+    } catch {
+      canonicalReadFailed = true;
+    }
+    if (!postPosition || postPosition.debtAmount == null) {
+      canonicalReadFailed = true;
+    }
+    if (canonicalReadFailed) {
+      throw new BlockedError(
+        "CONTRACT_UNREACHABLE",
+        "Cannot read canonical Zest position to verify on-chain debt state. Resume refuses to mark complete without canonical confirmation.",
+        "Retry when the canonical Zest read endpoint is reachable.",
+        { txVerifications }
+      );
+    }
+
+    const observedDebt = BigInt((postPosition as ZestPosition).debtAmount as string);
+    const preRunDebtRecorded = checkpoint.preRunDebt != null ? BigInt(String(checkpoint.preRunDebt)) : null;
+    const repayTargetRecorded = checkpoint.repayTarget != null ? BigInt(String(checkpoint.repayTarget)) : null;
+    if (preRunDebtRecorded != null && repayTargetRecorded != null) {
+      const expectedMaxDebt = preRunDebtRecorded > repayTargetRecorded ? preRunDebtRecorded - repayTargetRecorded : 0n;
+      // Allow a small accrued-interest buffer (1% of the original debt or 1000 base units, whichever larger).
+      const interestBuffer = preRunDebtRecorded / 100n > 1000n ? preRunDebtRecorded / 100n : 1000n;
+      if (observedDebt > expectedMaxDebt + interestBuffer) {
+        throw new BlockedError(
+          "CHECKPOINT_CHAIN_DIVERGENCE",
+          `Recorded legs show success but canonical Zest read still shows debt ${observedDebt.toString()} (expected max ≤ ${(expectedMaxDebt + interestBuffer).toString()} after repaying ${repayTargetRecorded.toString()} of pre-run ${preRunDebtRecorded.toString()}). Unwind did not achieve repay target.`,
+          "Inspect the leg txids against explorer; if any leg silently failed, run cancel and reconcile manually. Do not auto-mark complete.",
+          { observedDebt: observedDebt.toString(), preRunDebt: preRunDebtRecorded.toString(), repayTarget: repayTargetRecorded.toString(), interestBuffer: interestBuffer.toString(), txVerifications }
+        );
+      }
+    }
+
+    // All checks passed: legs broadcast and confirmed, canonical debt reduced as planned.
     const advanced: CheckpointFile = {
       ...checkpoint,
       state: "complete",
       currentStep: "complete",
       nextRequiredAction: "none",
+      observedPostDebt: observedDebt.toString(),
       timestampPerLeg: { ...((checkpoint.timestampPerLeg as JsonMap) ?? {}), resume_complete: new Date().toISOString() },
     };
     await persistCheckpoint(advanced);
@@ -1830,7 +1903,8 @@ async function cmdResume(opts: { wallet: string; confirm?: string }): Promise<vo
       wallet: opts.wallet,
       previousState: checkpoint.state,
       newState: "complete",
-      message: "All recorded legs verified success on chain. Checkpoint advanced to complete.",
+      message: "All recorded legs verified success on chain AND canonical debt state confirms target achieved. Checkpoint advanced to complete.",
+      observedPostDebt: observedDebt.toString(),
       txVerifications,
     });
   } catch (err) {
