@@ -185,9 +185,15 @@ const ASSET_CONFIGS: AssetConfig[] = [
     assetName: "ststx",
     vault: "SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-vault-ststx",
     decimals: 6,
-    canCollateral: true,
+    // stSTX has no Pyth feed published on Hermes — verified 2026-05-08T17:55Z UTC across
+    // 5 query variations against https://hermes.pyth.network/v2/price_feeds?asset_type=crypto
+    // (`stSTX`, `ststx`, `Crypto.STSTX`, `STSTX/USD`, `liquid`) and the full crypto-feed
+    // dump (only `Crypto.STX/USD` exists). Reusing STX's feed for stSTX would silently
+    // misprice the collateral on `v0-4-market.collateral-remove-redeem`, since stSTX is
+    // yield-bearing and accrues value above STX. canCollateral is disabled until Pyth
+    // publishes an STSTX feed. Reverify the registry before re-enabling.
+    canCollateral: false,
     canBorrow: true,
-    pythFeed: "ec7a775f46379b5e943c3526b1c8d54cd49749176b0b98e02dde68d1bd335c17",
   },
   {
     symbol: "USDC",
@@ -208,6 +214,10 @@ const ASSET_CONFIGS: AssetConfig[] = [
     decimals: 8,
     canCollateral: true,
     canBorrow: true,
+    // Crypto.USDH/USD verified 2026-05-08T17:55Z UTC on Pyth Hermes.
+    // (Adjacent disambiguation: Crypto.USDHL/USD = 1497fb79... is the hyper-liquid USDH
+    // variant — not used here.)
+    pythFeed: "f364e785775b4cb2f159ea823f8b5b9b669a4c221a3f845e518ba0e09611c553",
   },
 ];
 
@@ -2053,18 +2063,34 @@ async function cmdResume(opts: { wallet: string; confirm?: string }): Promise<vo
     const observedDebt = BigInt((postPosition as ZestPosition).debtAmount as string);
     const preRunDebtRecorded = checkpoint.preRunDebt != null ? BigInt(String(checkpoint.preRunDebt)) : null;
     const repayTargetRecorded = checkpoint.repayTarget != null ? BigInt(String(checkpoint.repayTarget)) : null;
-    if (preRunDebtRecorded != null && repayTargetRecorded != null) {
-      const expectedMaxDebt = preRunDebtRecorded > repayTargetRecorded ? preRunDebtRecorded - repayTargetRecorded : 0n;
-      // Allow a small accrued-interest buffer (1% of the original debt or 1000 base units, whichever larger).
-      const interestBuffer = preRunDebtRecorded / 100n > 1000n ? preRunDebtRecorded / 100n : 1000n;
-      if (observedDebt > expectedMaxDebt + interestBuffer) {
-        throw new BlockedError(
-          "CHECKPOINT_CHAIN_DIVERGENCE",
-          `Recorded legs show success but canonical Zest read still shows debt ${observedDebt.toString()} (expected max ≤ ${(expectedMaxDebt + interestBuffer).toString()} after repaying ${repayTargetRecorded.toString()} of pre-run ${preRunDebtRecorded.toString()}). Unwind did not achieve repay target.`,
-          "Inspect the leg txids against explorer; if any leg silently failed, run cancel and reconcile manually. Do not auto-mark complete.",
-          { observedDebt: observedDebt.toString(), preRunDebt: preRunDebtRecorded.toString(), repayTarget: repayTargetRecorded.toString(), interestBuffer: interestBuffer.toString(), txVerifications }
-        );
-      }
+    // Both fields are mandatory preconditions for the canonical-debt verification. If
+    // either is missing on resume — possible only via abnormal exit paths that left the
+    // checkpoint partially populated — the third silent-advance guard cannot fire. Refuse
+    // to advance rather than skip the verification silently. Closes diegomey + arc0btc
+    // null-precondition gap raised on PR review 4253964735 / 4253927245.
+    if (preRunDebtRecorded == null || repayTargetRecorded == null) {
+      throw new BlockedError(
+        "CHECKPOINT_CHAIN_DIVERGENCE",
+        `Checkpoint missing required preconditions for canonical-debt verification: preRunDebt=${preRunDebtRecorded === null ? "null" : "present"}, repayTarget=${repayTargetRecorded === null ? "null" : "present"}. Resume cannot mark complete without both. Run cancel to reconcile manually.`,
+        "Run cancel and inspect leg txids against the explorer; this checkpoint cannot be auto-advanced.",
+        {
+          observedDebt: observedDebt.toString(),
+          preRunDebt: preRunDebtRecorded == null ? "null" : preRunDebtRecorded.toString(),
+          repayTarget: repayTargetRecorded == null ? "null" : repayTargetRecorded.toString(),
+          txVerifications,
+        }
+      );
+    }
+    const expectedMaxDebt = preRunDebtRecorded > repayTargetRecorded ? preRunDebtRecorded - repayTargetRecorded : 0n;
+    // Allow a small accrued-interest buffer (1% of the original debt or 1000 base units, whichever larger).
+    const interestBuffer = preRunDebtRecorded / 100n > 1000n ? preRunDebtRecorded / 100n : 1000n;
+    if (observedDebt > expectedMaxDebt + interestBuffer) {
+      throw new BlockedError(
+        "CHECKPOINT_CHAIN_DIVERGENCE",
+        `Recorded legs show success but canonical Zest read still shows debt ${observedDebt.toString()} (expected max ≤ ${(expectedMaxDebt + interestBuffer).toString()} after repaying ${repayTargetRecorded.toString()} of pre-run ${preRunDebtRecorded.toString()}). Unwind did not achieve repay target.`,
+        "Inspect the leg txids against explorer; if any leg silently failed, run cancel and reconcile manually. Do not auto-mark complete.",
+        { observedDebt: observedDebt.toString(), preRunDebt: preRunDebtRecorded.toString(), repayTarget: repayTargetRecorded.toString(), interestBuffer: interestBuffer.toString(), txVerifications }
+      );
     }
 
     // All checks passed: legs broadcast and confirmed, canonical debt reduced as planned.
