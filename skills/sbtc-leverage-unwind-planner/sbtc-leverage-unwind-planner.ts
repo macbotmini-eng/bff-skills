@@ -1092,12 +1092,18 @@ function buildPriceFeeds(bytes: Buffer) {
 function buildWithdrawCollateralPostConditions(wallet: string, collateralAsset: AssetConfig, amount: bigint) {
   // wallet sends <= amount vault-share FT to the market (collateral burn), and
   // wallet receives the underlying via the redeem path. We pin both directions where expressible.
+  //
+  // The vault-share FT uses the literal SIP-010 fungible-token name "zft" across all
+  // Zest v0 vaults (verified via Hiro /v2/contracts/source on v0-vault-sbtc, v0-vault-ststx,
+  // v0-vault-usdc, v0-vault-usdh — all four contain `(define-fungible-token zft)`).
+  // The user-facing NAME constant differs per vault ("Zest sBTC", "Zest stSTX", etc.)
+  // but the on-chain FT identifier passed to postcondition matchers is uniformly "zft".
   const conditions = [];
   if (collateralAsset.vault) {
     conditions.push(
       Pc.principal(wallet)
         .willSendLte(amount)
-        .ft(collateralAsset.vault as `${string}.${string}`, `v0-${collateralAsset.assetName}`)
+        .ft(collateralAsset.vault as `${string}.${string}`, "zft")
     );
   }
   // Pyth fee sweep
