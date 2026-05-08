@@ -83,12 +83,21 @@ type BlockedCode =
   | "PENDING_TX"
   | "UNRESOLVED_CHECKPOINT"
   | "WALLET_INVALID"
+  | "WALLET_LOCKED"
   | "BALANCE_INSUFFICIENT"
   | "CONTRACT_UNREACHABLE"
   | "MARKET_ABI_MISSING"
   | "MISSING_REPAY_TARGET"
   | "MISSING_REPAY_TARGET_EXCLUSIVE"
-  | "UNSUPPORTED_DEBT_ASSET";
+  | "MISSING_DEBT_ASSET"
+  | "UNSUPPORTED_DEBT_ASSET"
+  | "MISSING_COLLATERAL_ASSET"
+  | "UNSUPPORTED_COLLATERAL_ASSET"
+  | "AGGREGATOR_BLOCKED"
+  | "SWAP_TX_NOT_SUCCESS"
+  | "REPAY_TX_NOT_SUCCESS"
+  | "WITHDRAW_TX_NOT_SUCCESS"
+  | "CHECKPOINT_CHAIN_DIVERGENCE";
 
 interface AssetConfig {
   symbol: string;
@@ -1225,6 +1234,41 @@ async function cmdRun(opts: RunOpts): Promise<void> {
     const walletDebtAssetBalance = balances.perAsset[debtAsset.symbol] ?? 0n;
     const mode = determineMode(opts, walletDebtAssetBalance, repayTarget.amount);
 
+
+    // Mempool depth check
+    const mempool = await fetchJson<JsonMap>(`${HIRO_API}/extended/v1/address/${opts.wallet}/mempool?limit=20`);
+    const pending = Number((mempool.results as Json[] | undefined)?.length ?? 0);
+    if (pending >= Number(opts.mempoolDepthLimit ?? DEFAULT_MEMPOOL_DEPTH_LIMIT)) {
+      throw new BlockedError(
+        "PENDING_TX",
+        `Wallet has ${pending} pending mempool tx; limit is ${opts.mempoolDepthLimit ?? DEFAULT_MEMPOOL_DEPTH_LIMIT}.`,
+        "Wait for pending txs to clear, then re-run."
+      );
+    }
+
+    const unwindId = generateUnwindId();
+    const stamp0 = new Date().toISOString();
+    let checkpoint: CheckpointFile = {
+      unwindId,
+      wallet: opts.wallet,
+      state: "unwind_plan_created",
+      currentStep: "unwind_plan_created",
+      blockedReason: null,
+      nextRequiredAction: "broadcast_repay",
+      debtAsset: debtAsset.symbol,
+      collateralAsset: positionBefore.collateralAsset,
+      repayTarget: repayTarget.amount.toString(),
+      preRunDebt: currentDebt.toString(),
+      preRunCollateral: positionBefore.collateralAmount,
+      pendingDepthBeforeEachWrite: { repay: pending },
+      timestampPerLeg: { unwind_plan_created: stamp0 },
+    };
+    await persistCheckpoint(checkpoint);
+
+    // Resolve signer (wallet must be unlocked; either via session or STACKS_PRIVATE_KEY env)
+    const signer = await resolveSigner(opts.wallet);
+    const transactions: JsonMap[] = [];
+
     // Mode C — collateral-release-assisted repay (bounded pre-repay release path).
     // Per PRD §Mode C: only if canonical Zest reads prove the specific withdrawal
     // amount is safe AND post-withdraw projected HF stays above floor. Local LTV
@@ -1349,40 +1393,6 @@ async function cmdRun(opts: RunOpts): Promise<void> {
       // After release, wallet should now hold the underlying which can be used for repay.
       // We fall through to the standard repay leg below.
     }
-
-    // Mempool depth check
-    const mempool = await fetchJson<JsonMap>(`${HIRO_API}/extended/v1/address/${opts.wallet}/mempool?limit=20`);
-    const pending = Number((mempool.results as Json[] | undefined)?.length ?? 0);
-    if (pending >= Number(opts.mempoolDepthLimit ?? DEFAULT_MEMPOOL_DEPTH_LIMIT)) {
-      throw new BlockedError(
-        "PENDING_TX",
-        `Wallet has ${pending} pending mempool tx; limit is ${opts.mempoolDepthLimit ?? DEFAULT_MEMPOOL_DEPTH_LIMIT}.`,
-        "Wait for pending txs to clear, then re-run."
-      );
-    }
-
-    const unwindId = generateUnwindId();
-    const stamp0 = new Date().toISOString();
-    let checkpoint: CheckpointFile = {
-      unwindId,
-      wallet: opts.wallet,
-      state: "unwind_plan_created",
-      currentStep: "unwind_plan_created",
-      blockedReason: null,
-      nextRequiredAction: "broadcast_repay",
-      debtAsset: debtAsset.symbol,
-      collateralAsset: positionBefore.collateralAsset,
-      repayTarget: repayTarget.amount.toString(),
-      preRunDebt: currentDebt.toString(),
-      preRunCollateral: positionBefore.collateralAmount,
-      pendingDepthBeforeEachWrite: { repay: pending },
-      timestampPerLeg: { unwind_plan_created: stamp0 },
-    };
-    await persistCheckpoint(checkpoint);
-
-    // Resolve signer (wallet must be unlocked; either via session or STACKS_PRIVATE_KEY env)
-    const signer = await resolveSigner(opts.wallet);
-    const transactions: JsonMap[] = [];
 
     // ── Mode B: swap-for-repay leg first ───────────────────────────────────
     if (mode === "B-swap-for-repay") {
