@@ -1441,11 +1441,44 @@ async function cmdRun(opts: RunOpts): Promise<void> {
       };
       await persistCheckpoint(checkpoint);
 
-      // Quote freshness check immediately before broadcast (PRD §Swap Requirements).
-      const quoteAgeSeconds = Math.floor((Date.now() - new Date(quote.fetchedAt).getTime()) / 1000);
-      if (quoteAgeSeconds > maxStaleness) {
-        // Fetch a fresh quote
-        quote = await fetchSwapQuote(sourceAsset, debtAsset, amountIn);
+      // Quote freshness + slippage re-validation immediately before broadcast (PRD §Swap
+      // Requirements + diegomey COMMENTED #4247009950 — quote re-validation must NOT
+      // skip on refresh). On a stale quote we re-fetch, then re-validate BOTH freshness
+      // and expected-out vs minAcceptableOut. If the refreshed quote is still stale or
+      // no longer meets slippage-buffered repay target, we BlockedError instead of
+      // silently broadcasting.
+      const initialQuoteAgeSeconds = Math.floor((Date.now() - new Date(quote.fetchedAt).getTime()) / 1000);
+      if (initialQuoteAgeSeconds > maxStaleness) {
+        const refreshed = await fetchSwapQuote(sourceAsset, debtAsset, amountIn);
+        const refreshedAgeSeconds = Math.floor((Date.now() - new Date(refreshed.fetchedAt).getTime()) / 1000);
+        if (refreshedAgeSeconds > maxStaleness) {
+          throw new BlockedError(
+            "STALE_QUOTE",
+            `Refreshed quote is ${refreshedAgeSeconds}s old, exceeds --max-quote-staleness-seconds=${maxStaleness}. Aggregator latency too high to safely broadcast.`,
+            "Retry when network/aggregator latency improves, or raise --max-quote-staleness-seconds with explicit operator approval.",
+            { initialAgeSeconds: initialQuoteAgeSeconds, refreshedAgeSeconds, maxStaleness }
+          );
+        }
+        if (refreshed.expectedAmountOut < minAcceptableOut) {
+          throw new BlockedError(
+            "STALE_QUOTE",
+            `Refreshed quote expects ${refreshed.expectedAmountOut} ${debtAsset.symbol} out at ${amountIn} ${sourceAsset.symbol} in, below slippage-buffered repay target ${minAcceptableOut}. Pricing moved during refresh.`,
+            "Re-run plan to re-size, or raise --slippage-bps with explicit operator approval, or top up the source asset.",
+            { refreshedExpectedOut: refreshed.expectedAmountOut.toString(), minAcceptableOut: minAcceptableOut.toString(), refreshedQuoteId: refreshed.quoteId }
+          );
+        }
+        // Refreshed quote passed both gates — persist new quote facts to checkpoint
+        // BEFORE broadcast so the on-disk record reflects what actually goes on chain.
+        quote = refreshed;
+        checkpoint = {
+          ...checkpoint,
+          quoteId: quote.quoteId,
+          quoteTimestamp: quote.fetchedAt,
+          quoteRefreshed: true,
+          quoteRefreshReason: `initial age ${initialQuoteAgeSeconds}s exceeded ${maxStaleness}s threshold; re-fetched at ${quote.fetchedAt}`,
+          timestampPerLeg: { ...(checkpoint.timestampPerLeg as JsonMap), optional_swap_for_repay_quote_refreshed: new Date().toISOString() },
+        };
+        await persistCheckpoint(checkpoint);
       }
 
       const swapResult = await broadcastSwapForRepay(opts.wallet, sourceAsset, debtAsset, amountIn, slippageBps);
@@ -1934,7 +1967,61 @@ async function cmdCancel(opts: { wallet: string; confirm?: string }): Promise<vo
       return;
     }
 
-    // Operator-acknowledged resolution. No on-chain action. Mark checkpoint as cancelled.
+    // On-chain reconciliation — addresses diegomey COMMENTED #4247009950 concern that
+    // cmdCancel performed no on-chain reconciliation. Cancel is now a forensic record:
+    // verify each recorded leg's actual chain status + read canonical Zest position
+    // at cancel-time so the operator has a permanent snapshot of what state the
+    // position was actually in when the unwind was abandoned.
+    const txVerifications: JsonMap[] = [];
+    const txFields: Array<{ field: keyof CheckpointFile; legName: string }> = [
+      { field: "swapTxId" as keyof CheckpointFile, legName: "swap-for-repay" },
+      { field: "repayTxId" as keyof CheckpointFile, legName: "repay" },
+      { field: "withdrawTxId" as keyof CheckpointFile, legName: "collateral-withdraw" },
+      { field: "residualSwapTxId" as keyof CheckpointFile, legName: "residual-swap" },
+    ];
+    for (const { field, legName } of txFields) {
+      const txid = checkpoint[field];
+      if (typeof txid === "string" && txid.length > 0) {
+        try {
+          const { status } = await verifyTxStatus(txid);
+          txVerifications.push({ leg: legName, txid, observedStatus: status, explorer: `${EXPLORER}/${txid}?chain=mainnet` });
+        } catch (verifyErr) {
+          // Reconciliation is best-effort during cancel — record the error and continue
+          // so the operator still gets a complete cancellation record even if Hiro is
+          // intermittently unreachable.
+          const errMsg = verifyErr instanceof Error ? verifyErr.message : String(verifyErr);
+          txVerifications.push({ leg: legName, txid, observedStatus: "verify-failed", error: errMsg, explorer: `${EXPLORER}/${txid}?chain=mainnet` });
+        }
+      }
+    }
+
+    // Canonical Zest re-read at cancel-time. Records exact debt/collateral state at the
+    // moment of abandonment so the operator's manual reconciliation has a known anchor.
+    let canonicalSnapshot: JsonMap | null = null;
+    let canonicalReadError: string | null = null;
+    try {
+      const debtAssetSymbol = checkpoint.debtAsset != null ? String(checkpoint.debtAsset) : null;
+      if (debtAssetSymbol) {
+        const debtAsset = resolveAsset(debtAssetSymbol);
+        const position = await readZestPosition(opts.wallet, debtAsset);
+        canonicalSnapshot = {
+          observedAt: new Date().toISOString(),
+          debtAmount: position.debtAmount,
+          collateralAmount: position.collateralAmount,
+          collateralAsset: position.collateralAsset,
+          healthFactor: position.healthFactor,
+          liquidatable: position.liquidatable,
+          accruedInterest: position.accruedInterest,
+        };
+      } else {
+        canonicalReadError = "checkpoint.debtAsset missing — cannot resolve asset for canonical re-read";
+      }
+    } catch (readErr) {
+      canonicalReadError = readErr instanceof Error ? readErr.message : String(readErr);
+    }
+
+    // Operator-acknowledged resolution. Mark checkpoint as cancelled with full forensic
+    // record of leg-level chain state + canonical position snapshot.
     const cancelled: CheckpointFile = {
       ...checkpoint,
       state: "complete",
@@ -1943,6 +2030,11 @@ async function cmdCancel(opts: { wallet: string; confirm?: string }): Promise<vo
       nextRequiredAction: "none",
       cancelled: true,
       cancelledAt: new Date().toISOString(),
+      cancelReconciliation: {
+        txVerifications,
+        canonicalSnapshot,
+        canonicalReadError,
+      },
     };
     await persistCheckpoint(cancelled);
 
@@ -1951,7 +2043,14 @@ async function cmdCancel(opts: { wallet: string; confirm?: string }): Promise<vo
       wallet: opts.wallet,
       previousState: checkpoint.state,
       newState: "complete-cancelled",
-      message: "Checkpoint marked cancelled. No on-chain action taken. Reconcile any partial on-chain state manually via direct primitive calls.",
+      message: canonicalSnapshot
+        ? "Checkpoint marked cancelled. Recorded leg-level chain status + canonical Zest position snapshot for forensic reference. Reconcile any residual on-chain state manually using these anchors."
+        : `Checkpoint marked cancelled. Recorded leg-level chain status. Canonical Zest re-read failed: ${canonicalReadError ?? "unknown"}. Operator must manually reconcile.`,
+      cancelReconciliation: {
+        txVerifications,
+        canonicalSnapshot,
+        canonicalReadError,
+      },
     });
   } catch (err) {
     fail(action, err);
