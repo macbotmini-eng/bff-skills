@@ -152,6 +152,7 @@ const DEFAULT_MIN_HEALTH_FACTOR = 1.5;
 const DEFAULT_MIN_GAS_RESERVE_USTX = 200_000n;
 const DEFAULT_MEMPOOL_DEPTH_LIMIT = 5;
 const DEFAULT_WAIT_SECONDS = 240;
+const DEFAULT_FEE_USTX = 70_000n;
 
 // Asset config — mirror of the merged borrow primitive's table; unwind only needs the
 // canBorrow set as candidate debt assets (STX is the first required target per PRD).
@@ -745,10 +746,21 @@ interface PlanOpts extends StatusOpts {
   minGasReserveUstx?: string;
   mempoolDepthLimit?: string;
   waitSeconds?: string;
+  feeUstx?: string;
 }
 
 interface RunOpts extends PlanOpts {
   confirm?: string;
+}
+
+// ─── Fee resolution ─────────────────────────────────────────────────────────
+
+function resolveFee(opts: { feeUstx?: string }): bigint {
+  if (opts.feeUstx == null || opts.feeUstx === "") return DEFAULT_FEE_USTX;
+  if (!/^\d+$/.test(opts.feeUstx)) {
+    throw new Error("--fee-ustx must be a non-negative integer in micro-STX");
+  }
+  return BigInt(opts.feeUstx);
 }
 
 // ─── Plan helpers ───────────────────────────────────────────────────────────
@@ -1413,7 +1425,7 @@ async function cmdRun(opts: RunOpts): Promise<void> {
       };
       await persistCheckpoint(checkpoint);
 
-      const releaseFee = 70_000n;
+      const releaseFee = resolveFee(opts);
       const releaseResult = await broadcastCollateralRemoveRedeem(
         opts.wallet,
         collateralAsset,
@@ -1636,7 +1648,7 @@ async function cmdRun(opts: RunOpts): Promise<void> {
     // before broadcast, release after tx confirms. Best-effort — if nonce-manager
     // is unreachable we fall back to Hiro auto-fetch (broadcastRepay treats
     // undefined nonce as "let SDK fetch").
-    const fee = 70_000n;
+    const fee = resolveFee(opts);
     let repayNonce: number | undefined;
     try {
       repayNonce = await acquireNonce(opts.wallet);
@@ -1936,13 +1948,37 @@ async function cmdRun(opts: RunOpts): Promise<void> {
   }
 }
 
-async function verifyTxStatus(txid: string): Promise<{ status: string; raw: JsonMap | null }> {
+// Tx-status classification surfaces 4 distinct states so callers can distinguish
+// "still in flight, may yet confirm" from "terminal failure, divergence is real":
+//   - anchored_success: tx_status === "success" — leg confirmed, advance OK.
+//   - terminal_failed:  abort_by_response / abort_by_post_condition / dropped_* — tx
+//                       will never confirm; resume must refuse and surface divergence.
+//   - pending:          tx_status === "pending" — in mempool, may anchor in subsequent
+//                       blocks; resume must refuse to advance but distinguish from
+//                       terminal failure so caller can wait + retry rather than cancel.
+//   - not_indexed:      Hiro returned 404 — could be propagation lag (just-broadcast tx
+//                       not yet ingested) OR truly missing (dropped pre-mempool, never
+//                       seen). Treat as in-flight with retry budget; only treat as
+//                       terminal after retry budget exhausted at the caller layer.
+type TxClassification =
+  | { kind: "anchored_success"; rawStatus: string; raw: JsonMap }
+  | { kind: "terminal_failed"; rawStatus: string; raw: JsonMap }
+  | { kind: "pending"; rawStatus: string; raw: JsonMap }
+  | { kind: "not_indexed"; rawStatus: "not_indexed"; raw: null };
+
+async function verifyTxStatus(txid: string): Promise<TxClassification> {
   try {
     const tx = await fetchJson<JsonMap>(`${HIRO_API}/extended/v1/tx/${txid}`);
-    return { status: String(tx.tx_status ?? "unknown"), raw: tx };
+    const rawStatus = String(tx.tx_status ?? "unknown");
+    if (rawStatus === "success") return { kind: "anchored_success", rawStatus, raw: tx };
+    if (rawStatus === "pending") return { kind: "pending", rawStatus, raw: tx };
+    // Everything else is terminal: abort_by_response, abort_by_post_condition,
+    // dropped_replace_by_fee, dropped_replace_across_fork, dropped_too_expensive,
+    // dropped_stale_garbage_collect, dropped_problematic, "unknown".
+    return { kind: "terminal_failed", rawStatus, raw: tx };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    if (message.startsWith("HTTP 404")) return { status: "not_indexed", raw: null };
+    if (message.startsWith("HTTP 404")) return { kind: "not_indexed", rawStatus: "not_indexed", raw: null };
     throw err;
   }
 }
@@ -2014,17 +2050,47 @@ async function cmdResume(opts: { wallet: string; confirm?: string }): Promise<vo
         );
       }
       if (typeof txid === "string" && txid.length > 0) {
-        const { status, raw } = await verifyTxStatus(txid);
-        txVerifications.push({ leg: legName, txid, observedStatus: status, explorer: `${EXPLORER}/${txid}?chain=mainnet` });
-        if (status !== "success") {
-          // Recorded leg is not actually success on chain — checkpoint diverged from reality.
+        const verdict = await verifyTxStatus(txid);
+        txVerifications.push({
+          leg: legName,
+          txid,
+          observedStatus: verdict.rawStatus,
+          classification: verdict.kind,
+          explorer: `${EXPLORER}/${txid}?chain=mainnet`,
+        });
+        if (verdict.kind === "terminal_failed") {
+          // Tx will never confirm — checkpoint diverged from reality.
           throw new BlockedError(
             "CHECKPOINT_CHAIN_DIVERGENCE",
-            `Recorded ${legName} txid ${txid} has chain status ${status} (not success). Checkpoint diverged from reality.`,
+            `Recorded ${legName} txid ${txid} has terminal chain status ${verdict.rawStatus} (will not confirm). Checkpoint diverged from reality.`,
             "Cancel this checkpoint and reconcile manually via direct primitive calls — do not auto-resume.",
-            { leg: legName, txid, observedStatus: status, raw: raw ?? null }
+            { leg: legName, txid, observedStatus: verdict.rawStatus, classification: verdict.kind, raw: verdict.raw ?? null }
           );
         }
+        if (verdict.kind === "pending") {
+          // Tx is still in mempool — may yet anchor. Refuse to advance but distinguish
+          // from terminal failure so the operator can wait + re-run resume rather than
+          // cancel a tx that's about to confirm.
+          throw new BlockedError(
+            "PENDING_TX",
+            `Recorded ${legName} txid ${txid} is still pending on chain (tx_status=pending). Resume cannot advance until terminal status confirmed.`,
+            "Wait for the tx to anchor, then re-run resume. If it stays pending past your fee window, run cancel.",
+            { leg: legName, txid, observedStatus: verdict.rawStatus, classification: verdict.kind, raw: verdict.raw ?? null }
+          );
+        }
+        if (verdict.kind === "not_indexed") {
+          // Hiro 404 — could be propagation lag (just-broadcast, not yet ingested) or
+          // truly dropped pre-mempool. Treat as in-flight; do NOT route to terminal.
+          // Caller can re-run resume after a delay; if still not_indexed past a
+          // reasonable budget, operator runs cancel.
+          throw new BlockedError(
+            "NOT_INDEXED_TX",
+            `Recorded ${legName} txid ${txid} is not indexed by Hiro (HTTP 404). Likely propagation lag; could be dropped pre-mempool.`,
+            "Re-run resume after a 60s delay. If status remains not_indexed across multiple retries, run cancel and reconcile manually.",
+            { leg: legName, txid, observedStatus: verdict.rawStatus, classification: verdict.kind }
+          );
+        }
+        // verdict.kind === "anchored_success" — proceed to next leg.
       }
     }
 
@@ -2150,8 +2216,14 @@ async function cmdCancel(opts: { wallet: string; confirm?: string }): Promise<vo
       const txid = checkpoint[field];
       if (typeof txid === "string" && txid.length > 0) {
         try {
-          const { status } = await verifyTxStatus(txid);
-          txVerifications.push({ leg: legName, txid, observedStatus: status, explorer: `${EXPLORER}/${txid}?chain=mainnet` });
+          const verdict = await verifyTxStatus(txid);
+          txVerifications.push({
+            leg: legName,
+            txid,
+            observedStatus: verdict.rawStatus,
+            classification: verdict.kind,
+            explorer: `${EXPLORER}/${txid}?chain=mainnet`,
+          });
         } catch (verifyErr) {
           // Reconciliation is best-effort during cancel — record the error and continue
           // so the operator still gets a complete cancellation record even if Hiro is
@@ -2258,7 +2330,8 @@ const planFlags = (cmd: Command) =>
     .option("--max-ltv-bps <bps>", "Maximum allowed LTV after every leg")
     .option("--min-gas-reserve-ustx <uSTX>", "Required gas reserve before each write", String(DEFAULT_MIN_GAS_RESERVE_USTX))
     .option("--mempool-depth-limit <count>", "Pending sender transaction limit before each write", String(DEFAULT_MEMPOOL_DEPTH_LIMIT))
-    .option("--wait-seconds <seconds>", "Confirmation wait window", String(DEFAULT_WAIT_SECONDS));
+    .option("--wait-seconds <seconds>", "Confirmation wait window", String(DEFAULT_WAIT_SECONDS))
+    .option("--fee-ustx <uSTX>", "Per-write-leg tx fee in micro-STX (Mode C release / repay / Mode D withdraw)", String(DEFAULT_FEE_USTX));
 
 walletOpt(program.command("doctor").description("Read-only environment + dependency check")).action(cmdDoctor);
 
