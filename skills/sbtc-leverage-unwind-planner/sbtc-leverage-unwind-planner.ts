@@ -1665,16 +1665,69 @@ async function cmdRun(opts: RunOpts): Promise<void> {
       );
     }
 
-    // Withdraw amount: use --withdraw-amount when provided; else cap at the canonical safe upper bound.
-    // Without an authoritative safe-withdrawable read, refuse — local LTV math is not authority (PRD §Canonical Zest Read Requirements).
+    // Compute safe-withdrawable collateral upper bound from the canonical post-repay
+    // position read. Addresses diegomey COMMENTED #4247009950 — Mode D safety gate
+    // was non-functional because safeWithdrawableCollateral always returned null.
+    //
+    // Math (HF-projection, conservative): given currentHF derived from canonical
+    // (collateral × adjustment) / debt, after withdrawing X collateral newHF =
+    // currentHF × (collateral - X) / collateral. Setting newHF = minHF and solving:
+    //   X = collateral × (1 - minHF / currentHF)
+    // We then apply a 10% buffer for accrued interest growth + price volatility
+    // during the broadcast window.
+    //
+    // If currentHF ≤ minHF (already at or below floor): safeWithdrawable = 0n.
+    // If post-repay debt = 0n (full close): the collateral is fully withdrawable
+    // because there is no liquidation risk left.
+    const minHF = Number(opts.minHealthFactor ?? DEFAULT_MIN_HEALTH_FACTOR);
+    const postCollateralStr = positionAfter.collateralAmount;
+    const postDebtStr = positionAfter.debtAmount;
+    const postHF = positionAfter.healthFactor;
+    let safeWithdrawableCollateral: bigint | null = null;
+    if (postCollateralStr != null && postDebtStr != null) {
+      const postCollateral = BigInt(postCollateralStr);
+      const postDebt = BigInt(postDebtStr);
+      if (postDebt === 0n) {
+        safeWithdrawableCollateral = postCollateral;
+      } else if (postHF != null && Number.isFinite(postHF) && postHF > minHF) {
+        const ratio = (postHF - minHF) / postHF; // fraction safely withdrawable before buffer
+        const buffered = ratio * 0.9; // 10% conservative buffer
+        const collateralNum = Number(postCollateral);
+        if (Number.isFinite(collateralNum)) {
+          safeWithdrawableCollateral = BigInt(Math.floor(collateralNum * buffered));
+        }
+      } else {
+        safeWithdrawableCollateral = 0n;
+      }
+    }
+
+    // Withdraw amount: use --withdraw-amount when provided; else cap at safeWithdrawableCollateral.
     const requestedWithdraw = opts.withdrawAmount
       ? (() => { if (!/^\d+$/.test(opts.withdrawAmount as string)) throw new Error("--withdraw-amount must be a positive integer in base units"); return BigInt(opts.withdrawAmount as string); })()
-      : null;
+      : safeWithdrawableCollateral;
     if (requestedWithdraw === null) {
       throw new BlockedError(
         "UNSAFE_COLLATERAL_WITHDRAWAL",
-        "--withdraw-amount is required for the post-repay withdraw leg in this batch (auto safe-withdrawable computation lands later).",
-        "Pass --withdraw-amount <base-units> bounded by the post-repay safe-withdrawable amount you read from status."
+        "Cannot compute safe-withdrawable collateral — post-repay canonical position read is missing collateralAmount, debtAmount, or healthFactor.",
+        "Pass --withdraw-amount <base-units> explicitly, or wait for canonical reads to recover and retry.",
+        { positionAfter: positionAfter as unknown as JsonMap }
+      );
+    }
+    if (requestedWithdraw === 0n) {
+      throw new BlockedError(
+        "UNSAFE_COLLATERAL_WITHDRAWAL",
+        `Computed safe-withdrawable is 0 — current HF ${postHF ?? "unknown"} is at or below --min-health-factor=${minHF}.`,
+        "Either repay more debt first, or wait for HF to improve, or skip --withdraw-collateral.",
+        { postHF, minHF, postCollateral: postCollateralStr, postDebt: postDebtStr }
+      );
+    }
+    // Refuse if explicit --withdraw-amount exceeds the computed safe upper bound.
+    if (safeWithdrawableCollateral != null && requestedWithdraw > safeWithdrawableCollateral) {
+      throw new BlockedError(
+        "UNSAFE_COLLATERAL_WITHDRAWAL",
+        `--withdraw-amount=${requestedWithdraw} exceeds computed safeWithdrawableCollateral=${safeWithdrawableCollateral} (HF-projection floor=${minHF}, currentHF=${postHF}).`,
+        `Lower --withdraw-amount to <= ${safeWithdrawableCollateral} or repay more debt first to raise HF headroom.`,
+        { requestedWithdraw: requestedWithdraw.toString(), safeWithdrawableCollateral: safeWithdrawableCollateral.toString(), postHF, minHF }
       );
     }
 
