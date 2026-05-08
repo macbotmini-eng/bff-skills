@@ -977,6 +977,66 @@ async function runAggregator(args: string[]): Promise<AggregatorJsonOutput> {
   return parsed;
 }
 
+// ─── nonce-manager subprocess wrappers ──────────────────────────────────────
+// Implements PRD §Nonce And Mempool Requirements + AGENT.md "nonce-manager
+// acquire before each broadcast; Hiro mempool depth check; release after
+// tx_status: success" claim. Addresses Agent A flag — nonce-manager was
+// declared in metadata.requires + AGENT.md but not invoked anywhere in code.
+//
+// API mirrors aibtcdev/skills/nonce-manager/nonce-manager.ts CLI:
+//   bun run nonce-manager/nonce-manager.ts acquire --address SP...
+//     → { nonce: 42, address: "SP...", source: "local|hiro" }
+//   bun run nonce-manager/nonce-manager.ts release --address SP... [--failed [--rejected|--broadcast]]
+
+function getNonceManagerEntry(): string {
+  return process.env.NONCE_MANAGER_ENTRY?.trim() || "skills/nonce-manager/nonce-manager.ts";
+}
+
+async function runNonceManager(args: string[]): Promise<JsonMap> {
+  const entry = getNonceManagerEntry();
+  const proc = Bun.spawn(["bun", "run", entry, ...args], { stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+  await proc.exited;
+  if (!stdout.trim()) {
+    throw new Error(`nonce-manager produced no stdout. stderr: ${stderr.slice(0, 400)}`);
+  }
+  let parsed: JsonMap;
+  try {
+    parsed = JSON.parse(stdout) as JsonMap;
+  } catch {
+    throw new Error(`nonce-manager stdout was not JSON: ${stdout.slice(0, 200)}`);
+  }
+  return parsed;
+}
+
+async function acquireNonce(wallet: string): Promise<number> {
+  const result = await runNonceManager(["acquire", "--address", wallet]);
+  // nonce-manager output shape per its SKILL.md: top-level { nonce, address, source }.
+  // Best-effort extraction handles either flat-shape or wrapped { status, data: { ... } }.
+  const flat = typeof result.nonce === "number" || typeof result.nonce === "string" ? result.nonce : null;
+  const wrapped = (result.data as JsonMap | undefined)?.nonce;
+  const nonceValue = flat ?? wrapped;
+  if (nonceValue == null) {
+    throw new Error(`nonce-manager acquire returned no nonce field: ${JSON.stringify(result).slice(0, 200)}`);
+  }
+  return Number(nonceValue);
+}
+
+async function releaseNonce(wallet: string, kind: "success" | "failed-broadcast" | "failed-rejected"): Promise<void> {
+  const args = ["release", "--address", wallet];
+  if (kind === "failed-broadcast") args.push("--failed", "--broadcast");
+  else if (kind === "failed-rejected") args.push("--failed", "--rejected");
+  // success: no extra flags
+  try {
+    await runNonceManager(args);
+  } catch (err) {
+    // Release is best-effort. The nonce-manager state will auto-resync from Hiro
+    // if it gets desynced; never block a successful tx broadcast on a release failure.
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[nonce-manager release ${kind}] best-effort failed: ${msg.slice(0, 200)}`);
+  }
+}
+
 interface AggregatorQuote {
   quoteId: string;
   expectedAmountOut: bigint;
@@ -1117,8 +1177,9 @@ async function broadcastCollateralRemoveRedeem(
   amount: bigint,
   minUnderlying: bigint,
   privateKey: string,
-  fee: bigint
-): Promise<{ txid: string; postConditionCount: number; pythFeeds: string[] }> {
+  fee: bigint,
+  nonce?: number
+): Promise<{ txid: string; postConditionCount: number; pythFeeds: string[]; nonce: number | undefined }> {
   const market = parseContractId(MARKET);
   const ftToken = parseContractId(collateralAsset.underlying);
   // Pyth feeds for the collateral asset (and any related debt assets) needed for HF check on chain
@@ -1141,13 +1202,14 @@ async function broadcastCollateralRemoveRedeem(
     postConditionMode: PostConditionMode.Deny,
     postConditions,
     fee,
+    ...(nonce != null ? { nonce: BigInt(nonce) } : {}),
   });
   const result = await broadcastTransaction({ transaction, network: STACKS_MAINNET });
   if ("error" in result && result.error) {
     throw new Error(`collateral-remove-redeem broadcast failed: ${result.error}${"reason" in result ? ` - ${result.reason}` : ""}`);
   }
   const txid = result.txid.startsWith("0x") ? result.txid : `0x${result.txid}`;
-  return { txid, postConditionCount: postConditions.length, pythFeeds: feeds };
+  return { txid, postConditionCount: postConditions.length, pythFeeds: feeds, nonce };
 }
 
 function buildRepayPostConditions(wallet: string, debtAsset: AssetConfig, amount: bigint) {
@@ -1167,8 +1229,9 @@ async function broadcastRepay(
   debtAsset: AssetConfig,
   amount: bigint,
   privateKey: string,
-  fee: bigint
-): Promise<{ txid: string; postConditionCount: number }> {
+  fee: bigint,
+  nonce?: number
+): Promise<{ txid: string; postConditionCount: number; nonce: number | undefined }> {
   const market = parseContractId(MARKET);
   const ftToken = parseContractId(debtAsset.underlying);
   const postConditions = buildRepayPostConditions(wallet, debtAsset, amount);
@@ -1187,13 +1250,14 @@ async function broadcastRepay(
     postConditionMode: PostConditionMode.Deny,
     postConditions,
     fee,
+    ...(nonce != null ? { nonce: BigInt(nonce) } : {}),
   });
   const result = await broadcastTransaction({ transaction, network: STACKS_MAINNET });
   if ("error" in result && result.error) {
     throw new Error(`Repay broadcast failed: ${result.error}${"reason" in result ? ` - ${result.reason}` : ""}`);
   }
   const txid = result.txid.startsWith("0x") ? result.txid : `0x${result.txid}`;
-  return { txid, postConditionCount: postConditions.length };
+  return { txid, postConditionCount: postConditions.length, nonce };
 }
 
 async function cmdRun(opts: RunOpts): Promise<void> {
@@ -1558,13 +1622,32 @@ async function cmdRun(opts: RunOpts): Promise<void> {
     await persistCheckpoint(checkpoint);
 
     // Broadcast repay (single leg for Mode A pure path)
+    // Per PRD §Nonce And Mempool Requirements + AGENT.md: acquire nonce-manager
+    // before broadcast, release after tx confirms. Best-effort — if nonce-manager
+    // is unreachable we fall back to Hiro auto-fetch (broadcastRepay treats
+    // undefined nonce as "let SDK fetch").
     const fee = 70_000n;
-    const broadcastResult = await broadcastRepay(opts.wallet, debtAsset, repayTarget.amount, signer.privateKey, fee);
+    let repayNonce: number | undefined;
+    try {
+      repayNonce = await acquireNonce(opts.wallet);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[nonce-manager acquire] best-effort failed pre-repay: ${msg.slice(0, 200)} — falling back to SDK auto-fetch`);
+    }
+    let broadcastResult: { txid: string; postConditionCount: number; nonce: number | undefined };
+    try {
+      broadcastResult = await broadcastRepay(opts.wallet, debtAsset, repayTarget.amount, signer.privateKey, fee, repayNonce);
+    } catch (broadcastErr) {
+      // Broadcast itself failed — tx never reached mempool. Nonce reusable.
+      if (repayNonce != null) await releaseNonce(opts.wallet, "failed-rejected");
+      throw broadcastErr;
+    }
     checkpoint = {
       ...checkpoint,
       state: "repay_broadcast",
       currentStep: "repay_broadcast",
       repayTxId: broadcastResult.txid,
+      repayNonce: broadcastResult.nonce ?? null,
       nextRequiredAction: "wait_for_repay_confirmation",
       timestampPerLeg: { ...(checkpoint.timestampPerLeg as JsonMap), repay_broadcast: new Date().toISOString() },
     };
@@ -1574,6 +1657,8 @@ async function cmdRun(opts: RunOpts): Promise<void> {
     const txStatus = await waitForTx(broadcastResult.txid, Number(opts.waitSeconds ?? DEFAULT_WAIT_SECONDS));
     const status = String(txStatus?.tx_status ?? "unknown");
     if (status !== "success") {
+      // Tx reached mempool but did not succeed — nonce was consumed.
+      if (broadcastResult.nonce != null) await releaseNonce(opts.wallet, "failed-broadcast");
       checkpoint = {
         ...checkpoint,
         state: "blocked_partial_unwind",
@@ -1590,6 +1675,9 @@ async function cmdRun(opts: RunOpts): Promise<void> {
         { txid: broadcastResult.txid, status, explorer: `${EXPLORER}/${broadcastResult.txid}?chain=mainnet` }
       );
     }
+
+    // Release nonce-manager: tx confirmed success.
+    if (broadcastResult.nonce != null) await releaseNonce(opts.wallet, "success");
 
     checkpoint = {
       ...checkpoint,
