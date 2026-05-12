@@ -643,51 +643,70 @@ interface ZestPosition {
 }
 
 async function readZestPosition(wallet: string, debtAsset: AssetConfig): Promise<ZestPosition> {
-  // Step 1: get user's bitmap on v0-assets
-  const bitmapCV = await callReadOnly(ASSETS, FN_GET_BITMAP, [], wallet);
-  const bitmapJson = cvJson(bitmapCV);
-  const bitmap = uintValue(okValue(bitmapJson) ?? bitmapJson);
+  // Fix for "Failed to parse String to BigInt" (was lines 661-678, "batch 5"
+  // stub per author's own TODO comments). Original decode treated
+  // position.debt and position.collateral as scalars, but Zest's
+  // v0-market-vault.get-position returns them as
+  // (list N (tuple (aid uint) (scaled|amount uint))). String() of a list is
+  // non-numeric; downstream BigInt() threw for every plan/run.
+  //
+  // Fix: compose zest-borrow-asset-primitive's status (canonical pattern,
+  // already merged) per the skill's stated "primitive-only, never inline"
+  // composition rule. The primitive emits scaledDebt × debtIndex / 1e12 =
+  // currentDebtEstimate, which is the actual repayable debt amount.
+  const collateralSymbol = "sBTC"; // planner default; per-collateral override
+                                   // is a separate concern (not yet plumbed
+                                   // through readZestPosition's signature).
+  const borrowStatus = await runBorrowPrimitive([
+    "status",
+    "--wallet", wallet,
+    "--borrow-asset", debtAsset.symbol,
+    "--collateral-asset", collateralSymbol,
+  ]);
 
-  // Step 2: get full position on v0-market-vault
-  const positionCV = await callReadOnly(
-    MARKET_VAULT,
-    FN_GET_POSITION,
-    [principalCV(wallet), uintCV(bitmap)],
-    wallet
-  );
-  const positionJson = cvJson(positionCV);
-  const position = okValue(positionJson) as JsonMap | null;
+  if (borrowStatus.status !== "success" || !borrowStatus.data) {
+    throw new BlockedError(
+      "ZEST_POSITION_READ_FAILED",
+      `zest-borrow-asset-primitive status did not return success: ${JSON.stringify(borrowStatus.error ?? "")}`,
+      "Run zest-borrow-asset-primitive status directly to inspect; verify the position exists on chain.",
+      { borrowStatus: borrowStatus as unknown as JsonMap }
+    );
+  }
 
-  // Position tuple shape (per merged borrow primitive readers):
-  //   collateral, debt, health, liquidatable, ...
-  // Field names may vary; we surface the raw decoded JSON and best-effort scalar pulls.
-  const debtRaw = fieldValue((position ?? {}).debt) ?? fieldValue((position ?? {}).total_debt);
-  const collateralRaw = fieldValue((position ?? {}).collateral) ?? fieldValue((position ?? {}).total_collateral);
-  const healthRaw = fieldValue((position ?? {}).health) ?? fieldValue((position ?? {}).hf);
-  const liqRaw = fieldValue((position ?? {}).liquidatable);
+  const data = borrowStatus.data as JsonMap;
+  const assets = data.assets as JsonMap | undefined;
+  const borrowField = assets?.borrow as JsonMap | undefined;
+  const collateralField = assets?.collateral as JsonMap | undefined;
+
+  const currentDebtRaw = borrowField?.currentDebtEstimate;
+  const collateralAmountRaw = collateralField?.amount;
+
+  const debtAmount = (typeof currentDebtRaw === "string" && /^\d+$/.test(currentDebtRaw))
+    ? currentDebtRaw
+    : null;
+  const collateralAmount = (typeof collateralAmountRaw === "string" && /^\d+$/.test(collateralAmountRaw))
+    ? collateralAmountRaw
+    : null;
 
   // Block height
   const tip = await fetchJson<JsonMap>(`${HIRO_API}/extended/v1/block?limit=1`);
   const blockHeight = Number((tip.results as JsonMap[] | undefined)?.[0]?.height ?? 0);
 
-  const debtAmount = debtRaw == null ? null : String(debtRaw);
-  const collateralAmount = collateralRaw == null ? null : String(collateralRaw);
-  const healthFactor =
-    healthRaw == null
-      ? null
-      : Number(BigInt(String(healthRaw))) / 1e6; // tentative scaling; refined in batch 5 once observed values seen on a real position
-
   return {
     debtAsset: debtAsset.symbol,
     debtAmount,
-    collateralAsset: null, // surfaced once we read per-asset collateral set in batch 5
+    collateralAsset: typeof collateralField?.symbol === "string" ? (collateralField.symbol as string) : null,
     collateralAmount,
-    healthFactor,
-    liquidatable: liqRaw == null ? null : Boolean(liqRaw),
-    accruedInterest: null, // requires per-asset vault read; batch 5
-    safeWithdrawableCollateral: null, // requires HF-projection math; batch 5
+    healthFactor: null, // placeholder removed per author's original "batch 5"
+                        // TODO. HF computation needs oracle reads or a Zest
+                        // read that exposes HF directly. Gating on canonical
+                        // safety reads in resolveContinueContext is the
+                        // correct path (mirrors merged windleg pattern).
+    liquidatable: null, // canonical liquidatable read not in borrow primitive
+    accruedInterest: null,
+    safeWithdrawableCollateral: null,
     asOfBlockHeight: blockHeight,
-    raw: position ?? {},
+    raw: borrowStatus.data ?? {},
   };
 }
 
@@ -1012,6 +1031,37 @@ async function runAggregator(args: string[]): Promise<AggregatorJsonOutput> {
 
 function getNonceManagerEntry(): string {
   return process.env.NONCE_MANAGER_ENTRY?.trim() || "skills/nonce-manager/nonce-manager.ts";
+}
+
+// zest-borrow-asset-primitive shell-out: used by readZestPosition to obtain
+// canonical scaledDebt × debtIndex / 1e12 = currentDebtEstimate plus collateral
+// amount. Mirrors the runAggregator/runNonceManager pattern.
+function getBorrowPrimitiveEntry(): string {
+  return process.env.ZEST_BORROW_PRIMITIVE_ENTRY?.trim() || "skills/zest-borrow-asset-primitive/zest-borrow-asset-primitive.ts";
+}
+
+interface BorrowPrimitiveOutput {
+  status: Status;
+  action: string;
+  data?: JsonMap;
+  error?: JsonMap | null;
+}
+
+async function runBorrowPrimitive(args: string[]): Promise<BorrowPrimitiveOutput> {
+  const entry = getBorrowPrimitiveEntry();
+  const proc = Bun.spawn(["bun", "run", entry, ...args], { stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+  await proc.exited;
+  if (!stdout.trim()) {
+    throw new Error(`zest-borrow-asset-primitive produced no stdout. stderr: ${stderr.slice(0, 400)}`);
+  }
+  let parsed: BorrowPrimitiveOutput;
+  try {
+    parsed = JSON.parse(stdout) as BorrowPrimitiveOutput;
+  } catch {
+    throw new Error(`zest-borrow-asset-primitive stdout was not JSON: ${stdout.slice(0, 200)}`);
+  }
+  return parsed;
 }
 
 async function runNonceManager(args: string[]): Promise<JsonMap> {
