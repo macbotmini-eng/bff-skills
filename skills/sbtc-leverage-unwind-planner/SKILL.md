@@ -15,7 +15,7 @@ metadata:
 
 ## What it does
 
-`sbtc-leverage-unwind-planner` safely reduces or closes a leveraged sBTC position created by the forward leverage cycle (`https://github.com/BitflowFinance/bff-skills/issues/561`). It is a composed write skill that sequences the reverse risk path:
+`sbtc-leverage-unwind-planner` safely reduces or closes a leveraged sBTC position created by the forward leverage cycle controller (`https://github.com/aibtcdev/skills/tree/main/bitflow-zest-sbtc-leverage-cycle`). It is a composed write skill that sequences the reverse risk path:
 
 1. read canonical Zest debt, collateral, health factor, and liquidation state,
 2. determine the repayment target,

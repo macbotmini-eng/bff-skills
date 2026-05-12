@@ -82,7 +82,7 @@ For each shelled-out primitive call, the controller parses the JSON output. If `
 ## Differentiation from existing work
 
 This skill exists alongside but does not duplicate:
-- `https://github.com/BitflowFinance/bff-skills/pull/578` (forward leverage cycle controller, our team's) — opens or increases positions; this skill reduces or closes them. Both share the same primitive surface and may be invoked in sequence on the same wallet, but their checkpoint state files are separate.
+- `https://github.com/aibtcdev/skills/tree/main/bitflow-zest-sbtc-leverage-cycle` (forward leverage cycle controller, our team's, merged upstream) — opens or increases positions; this skill reduces or closes them. Both share the same primitive surface and may be invoked in sequence on the same wallet, but their checkpoint state files are separate.
 - `https://github.com/aibtcdev/skills/tree/main/zest-auto-repay` (autonomous LTV guardian, single-leg) — monitors LTV and repays opportunistically; this skill is operator-initiated and composes repay + withdraw + optional swap.
 - `https://github.com/BitflowFinance/bff-skills/pull/348` (`sbtc-leverage-looper`) — the only adjacent staging attempt; PRD-rejected on four counts (instructions-not-execution, withdraw-first ordering, no mainnet unwind proof, no checkpoint). This skill is the corrected design.
 

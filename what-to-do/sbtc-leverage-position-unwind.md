@@ -157,6 +157,6 @@ At the end of this workflow, verify:
 
 ## See Also
 
-- [Bitflow + Zest sBTC Leverage Cycle](./bitflow-zest-sbtc-leverage-cycle.md)
+- [Bitflow + Zest sBTC Leverage Cycle](https://github.com/aibtcdev/skills/tree/main/bitflow-zest-sbtc-leverage-cycle)
 - [HODLMM Yield Router](./hodlmm-yield-router.md)
 - [Swap Tokens](./swap-tokens.md)
